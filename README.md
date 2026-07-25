@@ -141,7 +141,7 @@ lib_deps =
 *   **asic/sensor/leak/set** — Аварийный триггер протечки (ON).
     
 
-### 📤 Метрики и состояния (Published):
+##### 📤 Метрики и состояния (Published):
 
 *   **asic/sensor/temp\_in/state** — Температура на входе (°C).
     
@@ -154,6 +154,8 @@ lib_deps =
 *   **asic/damper/current\_ma/state** — Текущий фактический ток управления ЦАП (4–20 мА).
     
 *   **asic/status** — Статус контроллера (online / offline).
+
+![screenshot](screen.png)
 
 📜 Лицензия
 Этот проект распространяется под лицензией MIT.
