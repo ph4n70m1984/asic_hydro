@@ -98,6 +98,7 @@ const char* http_password = "admin_password";
 const char* ota_hostname = "asic-hydro-esp32";
 
 #endif
+```
 
 2. Сборка через PlatformIO (platformio.ini)
 Ini, TOML
