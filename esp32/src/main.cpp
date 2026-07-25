@@ -592,6 +592,7 @@ void setup() {
 
   WiFi.setSleep(WIFI_PS_NONE);
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname(ota_hostname);
   WiFi.begin(ssid, password);
   wifiReconnectStart = millis();
   wifiReconnecting = true;
@@ -690,6 +691,7 @@ void handleWiFiAsync() {
 
   if (!wifiReconnecting) {
     WiFi.disconnect();
+    WiFi.setHostname(ota_hostname);
     WiFi.begin(ssid, password);
     wifiReconnectStart = millis();
     wifiReconnecting = true;
@@ -697,6 +699,7 @@ void handleWiFiAsync() {
 
   if (millis() - wifiReconnectStart > 30000) {
     WiFi.disconnect(true);
+    WiFi.setHostname(ota_hostname);
     WiFi.begin(ssid, password);
     wifiReconnectStart = millis();
   }
@@ -719,6 +722,8 @@ void reconnectMQTT() {
     client.subscribe("asic/relay4/set");
     client.subscribe("asic/pump/set");
     client.subscribe("asic/valve/set");
+    client.subscribe("asic/relay7/set"); // <--- ДОБАВЛЕНО
+    client.subscribe("asic/relay8/set"); // <--- ДОБАВЛЕНО
     client.subscribe("asic/damper/set");
     client.subscribe("asic/sensor/leak/set");
     client.subscribe("asic/mode/set");
@@ -749,7 +754,7 @@ void reconnectMQTT() {
 // ================= MQTT DISCOVERY (Home Assistant) =================
 void sendHADiscovery() {
   char payload[1024];  
-  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v2.7.0"},"availability":[{"topic":"asic/status"}])raw";
+  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v2.8.0"},"availability":[{"topic":"asic/status"}])raw";
 
   #define PUB_DISCOVERY(component, object_id, ...) \
     snprintf(payload, sizeof(payload), "{%s,%s}", dev_av, (__VA_ARGS__)); \
@@ -787,9 +792,11 @@ void sendHADiscovery() {
   PUB_DISCOVERY("switch", "asic_3", R"raw("name":"ASIC 3","unique_id":"esp32_asic_r3","state_topic":"asic/relay3/state","command_topic":"asic/relay3/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:server-network")raw");
   PUB_DISCOVERY("switch", "asic_4", R"raw("name":"ASIC 4","unique_id":"esp32_asic_r4","state_topic":"asic/relay4/state","command_topic":"asic/relay4/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:server-network")raw");
 
-  // 5. РЕЛЕ ГИДРАВЛИКИ
+  // 5. РЕЛЕ ГИДРАВЛИКИ И ВСПОМОГАТЕЛЬНЫЕ
   PUB_DISCOVERY("switch", "pump", R"raw("name":"Coolant Pump","unique_id":"esp32_asic_pump","state_topic":"asic/pump/state","command_topic":"asic/pump/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:pump")raw");
   PUB_DISCOVERY("switch", "heat_valve", R"raw("name":"Heat Dump Valve","unique_id":"esp32_asic_valve","state_topic":"asic/valve/state","command_topic":"asic/valve/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:pipe-valve")raw");
+  PUB_DISCOVERY("switch", "relay_7", R"raw("name":"Aux Relay 7","unique_id":"esp32_asic_r7","state_topic":"asic/relay7/state","command_topic":"asic/relay7/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:toggle-switch")raw"); // <--- ДОБАВЛЕНО
+  PUB_DISCOVERY("switch", "relay_8", R"raw("name":"Aux Relay 8","unique_id":"esp32_asic_r8","state_topic":"asic/relay8/state","command_topic":"asic/relay8/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:toggle-switch")raw"); // <--- ДОБАВЛЕНО
 
   // 6. ЗАСЛОНКА
   PUB_DISCOVERY("number", "damper_set", R"raw("name":"Heat Valve Damper Open","unique_id":"esp32_asic_damper_set","state_topic":"asic/damper/state","command_topic":"asic/damper/set","min":0,"max":100,"step":1,"unit_of_measurement":"%","icon":"mdi:angle-acute")raw");
@@ -916,6 +923,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
   else if (strcmp(topic, "asic/relay4/set") == 0) setRelayChannel(4, isOn, true);
   else if (strcmp(topic, "asic/pump/set") == 0) setRelayChannel(5, isOn, true);
   else if (strcmp(topic, "asic/valve/set") == 0) setRelayChannel(6, isOn, true);
+  else if (strcmp(topic, "asic/relay7/set") == 0) setRelayChannel(7, isOn, true); // <--- ДОБАВЛЕНО
+  else if (strcmp(topic, "asic/relay8/set") == 0) setRelayChannel(8, isOn, true); // <--- ДОБАВЛЕНО
   
   // ===== ЗАСЛОНКА =====
   else if (strcmp(topic, "asic/damper/set") == 0) {
