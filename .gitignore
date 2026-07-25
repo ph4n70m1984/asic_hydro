@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+esp32/src/config.h
+esp32/src/secrets.h
+esp32/main.cpp
+esp32/main_rs485_on.cpp
