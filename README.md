@@ -100,8 +100,9 @@ const char* ota_hostname = "asic-hydro-esp32";
 #endif
 ```
 
-2. Сборка через PlatformIO (platformio.ini)
-Ini, TOML
+### ⚙️ Сборка через PlatformIO (`platformio.ini`)
+
+```ini
 [env:esp32dev]
 platform = espressif32
 board = esp32dev
@@ -114,38 +115,45 @@ lib_deps =
     milesburton/DallasTemperature @ ^3.11.0
     paulstoffregen/OneWire @ ^2.3.7
     4-20ma/ModbusMaster @ ^2.0.1
+```
+
 🌐 Структура MQTT Топиков
-Управление (Subscribed):
-asic/master/set — Мастер-выключатель всей системы (ON/OFF).
+-------------------------
 
-asic/pid/enable/set — Включение/выключение авто-ПИД (ON/OFF).
+#### 📥 Управление (Subscribed):
 
-asic/pid/invert/set — Инверсия направления ПИД (ON — Reverse/Охлаждение, OFF — Direct).
+*   **asic/master/set** — Мастер-выключатель всей системы (ON / OFF).
+    
+*   **asic/pid/enable/set** — Включение/выключение авто-ПИД (ON / OFF).
+    
+*   **asic/pid/invert/set** — Инверсия направления ПИД (ON — Reverse/Охлаждение, OFF — Direct).
+    
+*   **asic/pid/setpoint/set** — Уставка целевой температуры $T\_{out}$ (число 20.0–85.0).
+    
+*   **asic/pid/kp/set**, **ki/set**, **kd/set** — Настройка коэффициентов ПИД.
+    
+*   **asic/damper/set** — Ручная установка заслонки (0–100). _При ручном вводе ПИД автоматически выключается._
+    
+*   **asic/relay1/set** .. **asic/relay4/set** — Управление майнерами (ON / OFF).
+    
+*   **asic/pump/set** — Управление насосом (ON / OFF).
+    
+*   **asic/sensor/leak/set** — Аварийный триггер протечки (ON).
+    
 
-asic/pid/setpoint/set — Уставка целевой температуры Tout (число 20.0–85.0).
+### 📤 Метрики и состояния (Published):
 
-asic/pid/kp/set, ki/set, kd/set — Настройка коэффициентов ПИД.
-
-asic/damper/set — Ручная установка заслонки (0–100). При ручном вводе ПИД автоматически выключается.
-
-asic/relay1/set .. asic/relay4/set — Управление майнерами (ON/OFF).
-
-asic/pump/set — Управление насосом (ON/OFF).
-
-asic/sensor/leak/set — Аварийный триггер протечки (ON).
-
-Метрики и состояния (Published):
-asic/sensor/temp_in/state — Температура на входе (°C).
-
-asic/sensor/temp_out/state — Температура на выходе (°C).
-
-asic/sensor/pressure/state — Давление в контуре (Bar).
-
-asic/damper/state — Целевой % открытия заслонки.
-
-asic/damper/current_ma/state — Текущий фактический ток управления ЦАП (4–20 мА).
-
-asic/status — Статус контроллера (online / offline).
+*   **asic/sensor/temp\_in/state** — Температура на входе (°C).
+    
+*   **asic/sensor/temp\_out/state** — Температура на выходе (°C).
+    
+*   **asic/sensor/pressure/state** — Давление в контуре (Bar).
+    
+*   **asic/damper/state** — Целевой % открытия заслонки.
+    
+*   **asic/damper/current\_ma/state** — Текущий фактический ток управления ЦАП (4–20 мА).
+    
+*   **asic/status** — Статус контроллера (online / offline).
 
 📜 Лицензия
 Этот проект распространяется под лицензией MIT.
