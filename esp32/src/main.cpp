@@ -1,10 +1,10 @@
 /*
  * ========================================================================================
- * ⚡ ESP32 ASIC HYDRO CONTROLLER – ES32D26 Edition (WITH PID, SMOOTH DAMPER & ANTI-STUCK)
+ * ⚡ ESP32 ASIC HYDRO CONTROLLER – ES32D26 Edition (WITH PID, SMOOTH DAMPER & PHYSICAL BUTTONS)
  * ========================================================================================
  * Плата: Eletechsup ES32D26 (ESP32-DevKitC 38-PIN)
  * Реле CH1..CH8: Сдвиговый регистр 74HC595 (GPIO12 SER, GPIO13 OE, GPIO23 RCLK, GPIO22 SRCLK)
- * Входы IN1..IN8: Сдвиговый регистр 74HC165 (GPIO15 QH, GPIO2 CLK, GPIO0 SH)
+ * Входы IN1..IN8: Сдвиговый регистр 74HC165 (GPIO15 QH, GPIO2 CLK, GPIO0 SH) - Физические кнопки
  * Температура Tin: DS18B20 на шине OneWire (GPIO19)
  * Температура Tout: DS18B20 на шине OneWire (GPIO18)
  * Заслонка 4-20mA: Выход Io2 (GPIO26 / DAC2) с плавным ходом (Slew Rate Limiter)
@@ -55,6 +55,11 @@ constexpr uint8_t PIN_SRCLK_74HC595 = 22;
 constexpr uint8_t PIN_QH_74HC165  = 15;
 constexpr uint8_t PIN_CLK_74HC165 = 2;
 constexpr uint8_t PIN_SH_74HC165  = 0;
+
+// Переменные для антидребезга кнопок
+uint8_t lastInputStates = 0x00;
+unsigned long lastInputScan = 0;
+constexpr unsigned long INPUT_SCAN_INTERVAL = 50; // Опрос кнопок каждые 50 мс
 
 // ================= ПИНЫ DS18B20 =================
 constexpr uint8_t TEMP_IN_PIN  = 19;
@@ -162,6 +167,7 @@ void setRelayChannel(uint8_t channel, bool state, bool fromMQTT = false);
 bool getRelayChannel(uint8_t channel);
 uint8_t readByteInputs();
 bool readDigitalInput(uint8_t channel);
+void handlePhysicalInputs();
 void readAndPublishTemperatures();
 void readAndPublishPressure();
 void applyDamperDAC(float percent);
@@ -285,7 +291,7 @@ void publishAllRelayStates() {
   publishMasterState();
 }
 
-// ================= ЧТЕНИЕ ДИСКРЕТНЫХ ВХОДОВ =================
+// ================= ЧТЕНИЕ И ОБРАБОТКА ФИЗИЧЕСКИХ КНОПОК IN1..IN8 =================
 uint8_t readByteInputs() {
   uint8_t input_byte = 0x00;
 
@@ -310,7 +316,31 @@ bool readDigitalInput(uint8_t channel) {
   if (channel < 1 || channel > 8) return false;
   uint8_t raw = readByteInputs();
   bool rawBit = (raw & (1 << (7 - (channel - 1)))) != 0;
-  return !rawBit;
+  return !rawBit; // Возвращает true при замыкании на GND
+}
+
+// Обработчик физических кнопок С ФИКСАЦИЕЙ (тумблеры/выключатели)
+void handlePhysicalInputs() {
+  if (millis() - lastInputScan < INPUT_SCAN_INTERVAL) return;
+  lastInputScan = millis();
+
+  for (int i = 1; i <= 8; i++) {
+    bool isPressed = readDigitalInput(i); // true = контакт замкнут на GND
+    uint8_t bit = (1 << (i - 1));
+    bool wasPressed = (lastInputStates & bit) != 0;
+
+    // Если положение тумблера физически изменилось
+    if (isPressed != wasPressed) {
+      if (isPressed) {
+        lastInputStates |= bit;
+      } else {
+        lastInputStates &= ~bit;
+      }
+
+      // Синхронизируем состояние реле со сдвигом тумблера
+      setRelayChannel(i, isPressed, false);
+    }
+  }
 }
 
 // ================= УПРАВЛЕНИЕ ЗАСЛОНКОЙ (ПЛАВНЫЙ ХОД 4-20 мА) =================
@@ -632,6 +662,9 @@ void loop() {
 
   handleWiFiAsync();
 
+  // Опрос физических кнопок IN1..IN8
+  handlePhysicalInputs();
+
   // Обработка плавного движения заслонки
   processDamperRamp();
 
@@ -722,8 +755,8 @@ void reconnectMQTT() {
     client.subscribe("asic/relay4/set");
     client.subscribe("asic/pump/set");
     client.subscribe("asic/valve/set");
-    client.subscribe("asic/relay7/set"); // <--- ДОБАВЛЕНО
-    client.subscribe("asic/relay8/set"); // <--- ДОБАВЛЕНО
+    client.subscribe("asic/relay7/set");
+    client.subscribe("asic/relay8/set");
     client.subscribe("asic/damper/set");
     client.subscribe("asic/sensor/leak/set");
     client.subscribe("asic/mode/set");
@@ -795,8 +828,8 @@ void sendHADiscovery() {
   // 5. РЕЛЕ ГИДРАВЛИКИ И ВСПОМОГАТЕЛЬНЫЕ
   PUB_DISCOVERY("switch", "pump", R"raw("name":"Coolant Pump","unique_id":"esp32_asic_pump","state_topic":"asic/pump/state","command_topic":"asic/pump/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:pump")raw");
   PUB_DISCOVERY("switch", "heat_valve", R"raw("name":"Heat Dump Valve","unique_id":"esp32_asic_valve","state_topic":"asic/valve/state","command_topic":"asic/valve/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:pipe-valve")raw");
-  PUB_DISCOVERY("switch", "relay_7", R"raw("name":"Aux Relay 7","unique_id":"esp32_asic_r7","state_topic":"asic/relay7/state","command_topic":"asic/relay7/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:toggle-switch")raw"); // <--- ДОБАВЛЕНО
-  PUB_DISCOVERY("switch", "relay_8", R"raw("name":"Aux Relay 8","unique_id":"esp32_asic_r8","state_topic":"asic/relay8/state","command_topic":"asic/relay8/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:toggle-switch")raw"); // <--- ДОБАВЛЕНО
+  PUB_DISCOVERY("switch", "relay_7", R"raw("name":"Aux Relay 7","unique_id":"esp32_asic_r7","state_topic":"asic/relay7/state","command_topic":"asic/relay7/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:toggle-switch")raw");
+  PUB_DISCOVERY("switch", "relay_8", R"raw("name":"Aux Relay 8","unique_id":"esp32_asic_r8","state_topic":"asic/relay8/state","command_topic":"asic/relay8/set","payload_on":"ON","payload_off":"OFF","icon":"mdi:toggle-switch")raw");
 
   // 6. ЗАСЛОНКА
   PUB_DISCOVERY("number", "damper_set", R"raw("name":"Heat Valve Damper Open","unique_id":"esp32_asic_damper_set","state_topic":"asic/damper/state","command_topic":"asic/damper/set","min":0,"max":100,"step":1,"unit_of_measurement":"%","icon":"mdi:angle-acute")raw");
@@ -923,8 +956,8 @@ void callback(char* topic, byte* payload, unsigned int length) {
   else if (strcmp(topic, "asic/relay4/set") == 0) setRelayChannel(4, isOn, true);
   else if (strcmp(topic, "asic/pump/set") == 0) setRelayChannel(5, isOn, true);
   else if (strcmp(topic, "asic/valve/set") == 0) setRelayChannel(6, isOn, true);
-  else if (strcmp(topic, "asic/relay7/set") == 0) setRelayChannel(7, isOn, true); // <--- ДОБАВЛЕНО
-  else if (strcmp(topic, "asic/relay8/set") == 0) setRelayChannel(8, isOn, true); // <--- ДОБАВЛЕНО
+  else if (strcmp(topic, "asic/relay7/set") == 0) setRelayChannel(7, isOn, true);
+  else if (strcmp(topic, "asic/relay8/set") == 0) setRelayChannel(8, isOn, true);
   
   // ===== ЗАСЛОНКА =====
   else if (strcmp(topic, "asic/damper/set") == 0) {
