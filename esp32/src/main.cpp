@@ -1,11 +1,15 @@
 /*
  * ========================================================================================
- * ⚡ ESP32 ASIC HYDRO CONTROLLER – NATIVE ESP-IDF ASYNC (v3.8.0 Selectable Profile)
+ * ⚡ ESP32 ASIC HYDRO CONTROLLER – NATIVE ESP-IDF ASYNC (v3.8.2 QoS1 & Retain Edition)
  * ========================================================================================
  * Плата: Eletechsup ES32D26 (ESP32-DevKitC 38-PIN)
  * Поддерживаемые режимы (выбор 1 из 2):
  *  1. VALVE_4_20MA     : Кран / заслонка (DIP 1 = ON, DIP 3 = OFF). Диапазон 4..20 мА.
  *  2. DRY_COOLER_0_10V : Сухая градирня / VFD (DIP 1 = OFF, DIP 3 = ON). Диапазон 0..10 В.
+ * Изменения v3.8.2:
+ *  - Все публикации MQTT переведены на QoS 1 и Retain = true
+ *  - Все подписки MQTT переведены на QoS 1
+ *  - LWT конфигурация переведена на QoS 1
  * ========================================================================================
  */
 
@@ -85,10 +89,22 @@ unsigned long lastPidCompute = 0;
 constexpr unsigned long PID_COMPUTE_INTERVAL = 2000;
 constexpr float PID_DEADBAND_PCT = 1.0f;
 
-// ================= АНТИЗАЛИПАНИЕ =================
+// ================= АНТИЗАЛИПАНИЕ (FSM) =================
 unsigned long lastAntiStuckRun = 0;
-constexpr unsigned long ANTI_STUCK_INTERVAL = 86400000UL;
+constexpr unsigned long ANTI_STUCK_INTERVAL = 86400000UL; // 24 часа
 bool isAntiStuckActive = false;
+
+enum AntiStuckState {
+  ANTI_STUCK_IDLE = 0,
+  ANTI_STUCK_MOVE_100,
+  ANTI_STUCK_WAIT_100,
+  ANTI_STUCK_MOVE_0,
+  ANTI_STUCK_WAIT_0
+};
+
+AntiStuckState antiStuckStep = ANTI_STUCK_IDLE;
+unsigned long antiStuckStepTimer = 0;
+constexpr unsigned long ANTI_STUCK_MOVE_TIME = 15000UL; // 15 секунд
 
 // ================= MODBUS =================
 constexpr uint8_t RS485_DIR_PIN = 21;
@@ -139,17 +155,20 @@ void sendHADiscovery();
 void publishRevertTimer();
 void publishActuatorMetrics(float percent);
 void publishProfileStatus();
+void processAntiStuck();
 bool isMasterOn() { return (relayStateMask != 0x00); }
 
-void mqttPublish(const char* topic, const char* payload, bool retain = false) {
+// ЕДИНАЯ ФУНКЦИЯ ПУБЛИКАЦИИ: QoS = 1, RETAIN = true (по умолчанию)
+void mqttPublish(const char* topic, const char* payload, bool retain = true) {
   if (mqtt_client && isMqttConnected) {
-    esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 0, retain ? 1 : 0);
+    esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, retain ? 1 : 0);
   }
 }
 
+// ЕДИНАЯ ФУНКЦИЯ ПОДПИСКИ: QoS = 1
 void mqttSubscribe(const char* topic) {
   if (mqtt_client && isMqttConnected) {
-    esp_mqtt_client_subscribe(mqtt_client, topic, 0);
+    esp_mqtt_client_subscribe(mqtt_client, topic, 1);
   }
 }
 
@@ -165,15 +184,13 @@ void publishActuatorMetrics(float percent) {
 
   char strBuf[16];
   if (currentProfile == PROFILE_VALVE_4_20MA) {
-    // Режим 4..20 мА
     float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
     snprintf(strBuf, sizeof(strBuf), "%.2f", currentmA);
-    mqttPublish("asic/actuator/current_ma/state", strBuf, false);
+    mqttPublish("asic/actuator/current_ma/state", strBuf, true);
   } else {
-    // Режим 0..10 В
     float voltageV = (percent / 100.0f) * 10.0f;
     snprintf(strBuf, sizeof(strBuf), "%.2f", voltageV);
-    mqttPublish("asic/actuator/voltage_v/state", strBuf, false);
+    mqttPublish("asic/actuator/voltage_v/state", strBuf, true);
   }
 }
 
@@ -197,7 +214,7 @@ void publishRevertTimer() {
     snprintf(strBuf, sizeof(strBuf), "Manual");
   }
 
-  mqttPublish("asic/pid/revert_timer/state", strBuf, false);
+  mqttPublish("asic/pid/revert_timer/state", strBuf, true);
 }
 
 // ================= НАТИВНЫЙ ОБРАБОТЧИК MQTT =================
@@ -221,7 +238,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       mqttSubscribe("asic/damper/set");
       mqttSubscribe("asic/sensor/leak/set");
       mqttSubscribe("asic/mode/set");
-      mqttSubscribe("asic/profile/set"); // <--- Селектор режима
+      mqttSubscribe("asic/profile/set");
       mqttSubscribe("asic/ota");
       mqttSubscribe("asic/reset_nvs");
       mqttSubscribe("asic/pid/enable/set");
@@ -261,7 +278,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
           currentProfile = PROFILE_DRY_COOLER_0_10V;
         }
 
-        // Сохранение выбранного профиля в NVS
         preferences.begin("asic_storage", false);
         preferences.putUChar("out_profile", (uint8_t)currentProfile);
         preferences.end();
@@ -367,7 +383,7 @@ void initNativeMqtt() {
   mqtt_cfg.password = mqtt_pass;
   mqtt_cfg.lwt_topic = "asic/status";
   mqtt_cfg.lwt_msg = "offline";
-  mqtt_cfg.lwt_qos = 0;
+  mqtt_cfg.lwt_qos = 1; // QoS = 1 для LWT
   mqtt_cfg.lwt_retain = 1;
 
   mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -404,10 +420,10 @@ void publishRelayState(uint8_t channel) {
   else if (channel == 6) snprintf(topic, sizeof(topic), "asic/valve/state");
   else if (channel == 7) snprintf(topic, sizeof(topic), "asic/relay7/state");
   else if (channel == 8) snprintf(topic, sizeof(topic), "asic/relay8/state");
-  mqttPublish(topic, payload, false);
+  mqttPublish(topic, payload, true);
 }
 
-void publishMasterState() { mqttPublish("asic/master/state", isMasterOn() ? "ON" : "OFF", false); }
+void publishMasterState() { mqttPublish("asic/master/state", isMasterOn() ? "ON" : "OFF", true); }
 void publishSystemMode() { mqttPublish("asic/mode/state", isAutoMode ? "AUTO" : "MANUAL", true); }
 void publishAllRelayStates() { for (int i = 1; i <= 8; i++) publishRelayState(i); publishMasterState(); }
 
@@ -459,22 +475,19 @@ void setDamperPercent(float percent, bool isManual) {
   }
 
   char strBuf[16]; snprintf(strBuf, sizeof(strBuf), "%.1f", targetDamperPercent);
-  mqttPublish("asic/damper/state", strBuf, false);
+  mqttPublish("asic/damper/state", strBuf, true);
   publishActuatorMetrics(targetDamperPercent);
 }
 
-// РАСЧЕТ И ФИЗИЧЕСКИЙ ВЫВОД ЦАП В ЗАВИСИМОСТИ ОТ ВЫБРАННОГО РЕЖИМА
 void applyDamperDAC(float percent) {
   percent = constrain(percent, 0.0f, 100.0f);
   currentDamperPercent = percent;
 
   uint8_t dacValue = 0;
   if (currentProfile == PROFILE_VALVE_4_20MA) {
-    // Режим Кран / Заслонка (4..20 мА) -> 4мА = DAC ~51, 20мА = DAC 255
     float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
     dacValue = (uint8_t)round((currentmA / 20.0f) * 255.0f);
   } else {
-    // Режим Сухая градирня (0..10 В) -> 0V = DAC 0, 10V = DAC 255
     dacValue = (uint8_t)round((percent / 100.0f) * 255.0f);
   }
 
@@ -493,12 +506,60 @@ void processDamperRamp() {
   }
 }
 
+void processAntiStuck() {
+  unsigned long now = millis();
+
+  if (!isAntiStuckActive && isAutoMode && isPidEnabled) {
+    if (now - lastAntiStuckRun >= ANTI_STUCK_INTERVAL) {
+      lastAntiStuckRun = now;
+      isAntiStuckActive = true;
+      antiStuckStep = ANTI_STUCK_MOVE_100;
+      mqttPublish("asic/status/info", "Anti-Stuck cycle started", true);
+    }
+  }
+
+  if (isAntiStuckActive) {
+    switch (antiStuckStep) {
+      case ANTI_STUCK_MOVE_100:
+        setDamperPercent(100.0f, false);
+        antiStuckStepTimer = now;
+        antiStuckStep = ANTI_STUCK_WAIT_100;
+        break;
+
+      case ANTI_STUCK_WAIT_100:
+        if (now - antiStuckStepTimer >= ANTI_STUCK_MOVE_TIME) {
+          antiStuckStep = ANTI_STUCK_MOVE_0;
+        }
+        break;
+
+      case ANTI_STUCK_MOVE_0:
+        setDamperPercent(0.0f, false);
+        antiStuckStepTimer = now;
+        antiStuckStep = ANTI_STUCK_WAIT_0;
+        break;
+
+      case ANTI_STUCK_WAIT_0:
+        if (now - antiStuckStepTimer >= ANTI_STUCK_MOVE_TIME) {
+          isAntiStuckActive = false;
+          antiStuckStep = ANTI_STUCK_IDLE;
+          mqttPublish("asic/status/info", "Anti-Stuck cycle completed", true);
+        }
+        break;
+
+      default:
+        isAntiStuckActive = false;
+        antiStuckStep = ANTI_STUCK_IDLE;
+        break;
+    }
+  }
+}
+
 void readAndPublishPressure() {
   if (node.readHoldingRegisters(0x0004, 1) == node.ku8MBSuccess) {
     float kpa = (int16_t)node.getResponseBuffer(0) / 10.0f;
     currentPressureBar = kpa / 100.0f;
     char strBuf[16]; snprintf(strBuf, sizeof(strBuf), "%.2f", currentPressureBar);
-    mqttPublish("asic/sensor/pressure/state", strBuf, false);
+    mqttPublish("asic/sensor/pressure/state", strBuf, true);
   }
 }
 
@@ -513,7 +574,7 @@ void readAndPublishTemperatures() {
   if (tempIn > -55.0f && tempIn < 125.0f) {
     lastTempIn = tempIn;
     snprintf(strBuf, sizeof(strBuf), "%.1f", tempIn);
-    mqttPublish("asic/sensor/temp_in/state", strBuf, false);
+    mqttPublish("asic/sensor/temp_in/state", strBuf, true);
   }
   
   if (tempOut > -55.0f && tempOut < 125.0f) {
@@ -527,7 +588,7 @@ void readAndPublishTemperatures() {
     }
 
     snprintf(strBuf, sizeof(strBuf), "%.1f", tempOut);
-    mqttPublish("asic/sensor/temp_out/state", strBuf, false);
+    mqttPublish("asic/sensor/temp_out/state", strBuf, true);
   } else { 
     tempOutOnline = false; 
   }
@@ -586,8 +647,7 @@ void publishPidStatus() {
 // ================= HA DISCOVERY =================
 void sendHADiscovery() {
   char payload[1024];  
-  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_v380"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v3.8.0(SelectableProfile)"},"availability":[{"topic":"asic/status"}])raw";
-
+  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_board"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v3.8.2"},"availability":[{"topic":"asic/status"}])raw";
   #define PUB_DISC(comp, id, ...) snprintf(payload, sizeof(payload), "{%s,%s}", dev_av, (__VA_ARGS__)); mqttPublish("homeassistant/" comp "/asic_hydro/" id "/config", payload, true); delay(20);
 
   // 1. СИСТЕМНЫЕ ПЕРЕКЛЮЧАТЕЛИ И СЕЛЕКТОР ПРОФИЛЯ
@@ -633,7 +693,7 @@ void sendHADiscovery() {
 void setupWebOTA() {
   server.on("/", HTTP_GET, [](){
     if (!server.authenticate(http_username, http_password)) return server.requestAuthentication();
-    const char html[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><title>ASIC OTA</title><meta charset='utf-8'></head><body><h2>⚡ ASIC Hydro Controller (v3.8.0)</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button type='submit'>Upload</button></form></body></html>)rawliteral";
+    const char html[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><title>ASIC OTA</title><meta charset='utf-8'></head><body><h2>⚡ ASIC Hydro Controller (v3.8.2)</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button type='submit'>Upload</button></form></body></html>)rawliteral";
     server.send(200, "text/html", html);
   });
   
@@ -761,6 +821,7 @@ void loop() {
     lastPressureCheck = now;
   }
 
+  processAntiStuck();
   processPID();
 
   if (now - lastTimerPublish >= TIMER_PUBLISH_INTERVAL) {
