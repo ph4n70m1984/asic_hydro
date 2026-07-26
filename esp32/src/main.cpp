@@ -1,13 +1,11 @@
 /*
  * ========================================================================================
- * ⚡ ESP32 ASIC HYDRO CONTROLLER – NATIVE ESP-IDF ASYNC (v3.6.2 Safe Boot 4mA)
+ * ⚡ ESP32 ASIC HYDRO CONTROLLER – NATIVE ESP-IDF ASYNC (v3.8.0 Selectable Profile)
  * ========================================================================================
  * Плата: Eletechsup ES32D26 (ESP32-DevKitC 38-PIN)
- * Улучшения:
- *  - При старте/включении заслонка ПРИНУДИТЕЛЬНО уходит в 0% (4.00 мА)
- *  - Восстановлен сенсор тока 4–20 мА в HA Discovery
- *  - Сохранение isForceManual в NVS
- *  - Индикация таймера автовозврата и защита от переполнения millis()
+ * Поддерживаемые режимы (выбор 1 из 2):
+ *  1. VALVE_4_20MA     : Кран / заслонка (DIP 1 = ON, DIP 3 = OFF). Диапазон 4..20 мА.
+ *  2. DRY_COOLER_0_10V : Сухая градирня / VFD (DIP 1 = OFF, DIP 3 = ON). Диапазон 0..10 В.
  * ========================================================================================
  */
 
@@ -27,13 +25,21 @@
 
 #include "config.h"
 
+// ================= ПРОФИЛИ ВЫХОДА (ИЗОЛИРОВАННЫЙ ВЫБОР) =================
+enum OutputProfile {
+  PROFILE_VALVE_4_20MA = 0,    // Заслонка / Кран (4..20 мА)
+  PROFILE_DRY_COOLER_0_10V = 1 // Сухая градирня / Частотник (0..10 В)
+};
+
+OutputProfile currentProfile = PROFILE_VALVE_4_20MA;
+
 // ================= ПИНЫ 74HC595 (РЕЛЕ) =================
 constexpr uint8_t PIN_SER_74HC595   = 12;
 constexpr uint8_t PIN_OE_74HC595    = 13;
 constexpr uint8_t PIN_RCLK_74HC595  = 23;
 constexpr uint8_t PIN_SRCLK_74HC595 = 22;
 
-// ================= ПИНЫ 74HC165 (ВХОДЫ) =================
+// ================= ПИНЫ 74HC165 (ВХОДЫ IN1..IN8) =================
 constexpr uint8_t PIN_QH_74HC165  = 15;
 constexpr uint8_t PIN_CLK_74HC165 = 2;
 constexpr uint8_t PIN_SH_74HC165  = 0;
@@ -55,9 +61,9 @@ float filteredTempOut = -127.0f;
 constexpr float EMA_ALPHA = 0.2f; 
 bool tempInOnline = false, tempOutOnline = false;
 
-// ================= ЗАСЛОНКА =================
+// ================= ВЫХОД ЦАП (GPIO26 / DAC2) =================
 constexpr uint8_t DAMPER_OUTPUT_PIN = 26;
-float currentDamperPercent = 0.0f, targetDamperPercent = 0.0f; // Старт строго с 0% (4мА)
+float currentDamperPercent = 0.0f, targetDamperPercent = 0.0f; 
 
 constexpr float DAMPER_STEP_PCT = 0.5f;
 constexpr unsigned long DAMPER_RAMP_INTERVAL = 100;
@@ -68,7 +74,6 @@ float pidSetpoint = 42.0f, pidInput = 0.0f, pidOutput = 0.0f;
 float pidKp = 3.5f, pidKi = 0.05f, pidKd = 0.8f;
 bool isPidEnabled = false, isPidInverted = true;
 
-// Логика ручной блокировки и автовозврата
 bool isForceManual = false; 
 unsigned long manualOverrideStartTime = 0;
 constexpr unsigned long PID_AUTO_REVERT_TIMEOUT = 15 * 60 * 1000UL; // 15 минут
@@ -132,7 +137,8 @@ void setDamperPercent(float percent, bool isManual = false);
 void applyDamperDAC(float percent);
 void sendHADiscovery();
 void publishRevertTimer();
-void publishDampermA(float percent);
+void publishActuatorMetrics(float percent);
+void publishProfileStatus();
 bool isMasterOn() { return (relayStateMask != 0x00); }
 
 void mqttPublish(const char* topic, const char* payload, bool retain = false) {
@@ -147,16 +153,30 @@ void mqttSubscribe(const char* topic) {
   }
 }
 
-// ================= ПУБЛИКАЦИЯ ТОКА В мА =================
-void publishDampermA(float percent) {
+// ================= ПУБЛИКАЦИЯ СТАТУСА И МЕТРИК ВЫБРАННОГО РЕЖИМА =================
+void publishProfileStatus() {
   if (!isMqttConnected) return;
-  float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
-  char strBuf[16];
-  snprintf(strBuf, sizeof(strBuf), "%.2f", currentmA);
-  mqttPublish("asic/damper/current_ma/state", strBuf, false);
+  const char* profStr = (currentProfile == PROFILE_VALVE_4_20MA) ? "VALVE_4_20MA" : "DRY_COOLER_0_10V";
+  mqttPublish("asic/profile/state", profStr, true);
 }
 
-// ================= ИНДИКАЦИЯ ТАЙМЕРА АВТОВОЗВРАТА =================
+void publishActuatorMetrics(float percent) {
+  if (!isMqttConnected) return;
+
+  char strBuf[16];
+  if (currentProfile == PROFILE_VALVE_4_20MA) {
+    // Режим 4..20 мА
+    float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
+    snprintf(strBuf, sizeof(strBuf), "%.2f", currentmA);
+    mqttPublish("asic/actuator/current_ma/state", strBuf, false);
+  } else {
+    // Режим 0..10 В
+    float voltageV = (percent / 100.0f) * 10.0f;
+    snprintf(strBuf, sizeof(strBuf), "%.2f", voltageV);
+    mqttPublish("asic/actuator/voltage_v/state", strBuf, false);
+  }
+}
+
 void publishRevertTimer() {
   if (!isMqttConnected) return;
 
@@ -201,6 +221,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       mqttSubscribe("asic/damper/set");
       mqttSubscribe("asic/sensor/leak/set");
       mqttSubscribe("asic/mode/set");
+      mqttSubscribe("asic/profile/set"); // <--- Селектор режима
       mqttSubscribe("asic/ota");
       mqttSubscribe("asic/reset_nvs");
       mqttSubscribe("asic/pid/enable/set");
@@ -233,7 +254,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 
       bool isOn = (strcmp(message, "ON") == 0);
 
-      if (strcmp(topic, "asic/pid/enable/set") == 0) {
+      if (strcmp(topic, "asic/profile/set") == 0) {
+        if (strcmp(message, "VALVE_4_20MA") == 0) {
+          currentProfile = PROFILE_VALVE_4_20MA;
+        } else if (strcmp(message, "DRY_COOLER_0_10V") == 0) {
+          currentProfile = PROFILE_DRY_COOLER_0_10V;
+        }
+
+        // Сохранение выбранного профиля в NVS
+        preferences.begin("asic_storage", false);
+        preferences.putUChar("out_profile", (uint8_t)currentProfile);
+        preferences.end();
+
+        applyDamperDAC(currentDamperPercent);
+        publishProfileStatus();
+        publishActuatorMetrics(currentDamperPercent);
+      }
+      else if (strcmp(topic, "asic/pid/enable/set") == 0) {
         if (!isForceManual) {
           isPidEnabled = isOn;
           manualOverrideStartTime = 0;
@@ -306,7 +343,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       else if (strcmp(topic, "asic/reset_nvs") == 0) {
         preferences.begin("asic_storage", false); preferences.clear(); preferences.end();
         relayStateMask = 0x00; isAutoMode = true; isPidEnabled = false; isForceManual = false; isPidInverted = true;
-        sendByteRelay(); publishAllRelayStates(); publishSystemMode(); publishPidStatus(); publishRevertTimer();
+        currentProfile = PROFILE_VALVE_4_20MA;
+        sendByteRelay(); publishAllRelayStates(); publishSystemMode(); publishPidStatus(); publishProfileStatus(); publishRevertTimer();
       }
       else if (strcmp(topic, "asic/ota") == 0 && strcmp(message, "update") == 0) {
         ota_active = true; relayStateMask = 0x00; sendByteRelay();
@@ -401,7 +439,7 @@ void handlePhysicalInputs() {
   }
 }
 
-// ================= ДАТЧИКИ И ЗАСЛОНКА =================
+// ================= ДАТЧИКИ И ИСПОЛНИТЕЛЬНЫЕ МЕХАНИЗМЫ =================
 void setDamperPercent(float percent, bool isManual) {
   targetDamperPercent = constrain(percent, 0.0f, 100.0f);
 
@@ -422,14 +460,25 @@ void setDamperPercent(float percent, bool isManual) {
 
   char strBuf[16]; snprintf(strBuf, sizeof(strBuf), "%.1f", targetDamperPercent);
   mqttPublish("asic/damper/state", strBuf, false);
-  publishDampermA(targetDamperPercent);
+  publishActuatorMetrics(targetDamperPercent);
 }
 
+// РАСЧЕТ И ФИЗИЧЕСКИЙ ВЫВОД ЦАП В ЗАВИСИМОСТИ ОТ ВЫБРАННОГО РЕЖИМА
 void applyDamperDAC(float percent) {
   percent = constrain(percent, 0.0f, 100.0f);
   currentDamperPercent = percent;
-  float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
-  dacWrite(DAMPER_OUTPUT_PIN, (uint8_t)round((currentmA / 20.0f) * 255.0f));
+
+  uint8_t dacValue = 0;
+  if (currentProfile == PROFILE_VALVE_4_20MA) {
+    // Режим Кран / Заслонка (4..20 мА) -> 4мА = DAC ~51, 20мА = DAC 255
+    float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
+    dacValue = (uint8_t)round((currentmA / 20.0f) * 255.0f);
+  } else {
+    // Режим Сухая градирня (0..10 В) -> 0V = DAC 0, 10V = DAC 255
+    dacValue = (uint8_t)round((percent / 100.0f) * 255.0f);
+  }
+
+  dacWrite(DAMPER_OUTPUT_PIN, dacValue);
 }
 
 void processDamperRamp() {
@@ -439,7 +488,7 @@ void processDamperRamp() {
     if (abs(currentDamperPercent - targetDamperPercent) > 0.05f) {
       currentDamperPercent += (currentDamperPercent < targetDamperPercent) ? DAMPER_STEP_PCT : -DAMPER_STEP_PCT;
       applyDamperDAC(currentDamperPercent);
-      publishDampermA(currentDamperPercent);
+      publishActuatorMetrics(currentDamperPercent);
     }
   }
 }
@@ -537,12 +586,13 @@ void publishPidStatus() {
 // ================= HA DISCOVERY =================
 void sendHADiscovery() {
   char payload[1024];  
-  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_v362"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v3.6.2(Safe Boot)"},"availability":[{"topic":"asic/status"}])raw";
+  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_v380"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v3.8.0(SelectableProfile)"},"availability":[{"topic":"asic/status"}])raw";
 
   #define PUB_DISC(comp, id, ...) snprintf(payload, sizeof(payload), "{%s,%s}", dev_av, (__VA_ARGS__)); mqttPublish("homeassistant/" comp "/asic_hydro/" id "/config", payload, true); delay(20);
 
-  // 1. СИСТЕМНЫЕ ПЕРЕКЛЮЧАТЕЛИ
+  // 1. СИСТЕМНЫЕ ПЕРЕКЛЮЧАТЕЛИ И СЕЛЕКТОР ПРОФИЛЯ
   PUB_DISC("switch", "master", R"raw("name":"Master Switch","unique_id":"eh_master","state_topic":"asic/master/state","command_topic":"asic/master/set","icon":"mdi:power")raw");
+  PUB_DISC("select", "cooling_profile", R"raw("name":"Cooling Equipment Type","unique_id":"eh_profile","state_topic":"asic/profile/state","command_topic":"asic/profile/set","options":["VALVE_4_20MA","DRY_COOLER_0_10V"],"icon":"mdi:fan-auto","entity_category":"config")raw");
   PUB_DISC("switch", "pid_en", R"raw("name":"PID Auto-Control","unique_id":"eh_pid_en","state_topic":"asic/pid/enable/state","command_topic":"asic/pid/enable/set","icon":"mdi:thermostat-auto")raw");
   PUB_DISC("switch", "force_manual", R"raw("name":"Force Manual Mode (Hold PID)","unique_id":"eh_force_man","state_topic":"asic/pid/force_manual/state","command_topic":"asic/pid/force_manual/set","icon":"mdi:hand-back-right","entity_category":"config")raw");
   PUB_DISC("switch", "pid_inv", R"raw("name":"PID Invert Direction","unique_id":"eh_pid_inv","state_topic":"asic/pid/invert/state","command_topic":"asic/pid/invert/set","icon":"mdi:swap-horizontal","entity_category":"config")raw");
@@ -569,9 +619,10 @@ void sendHADiscovery() {
   // 5. СБРОС ПАМЯТИ
   PUB_DISC("button", "reset_nvs", R"raw("name":"Reset Memory (NVS)","unique_id":"eh_reset_nvs","command_topic":"asic/reset_nvs","payload_press":"RESET","icon":"mdi:restore","entity_category":"config")raw");
 
-  // 6. ДАТЧИКИ И ЗАСЛОНКА (ВКЛЮЧАЯ ТОК В мА)
-  PUB_DISC("number", "damper", R"raw("name":"Damper Open","unique_id":"eh_damper","state_topic":"asic/damper/state","command_topic":"asic/damper/set","min":0,"max":100,"unit_of_measurement":"%")raw");
-  PUB_DISC("sensor", "damper_ma", R"raw("name":"Heat Valve Damper Current","unique_id":"eh_damper_ma","state_topic":"asic/damper/current_ma/state","unit_of_measurement":"mA","icon":"mdi:current-ac")raw");
+  // 6. ДАТЧИКИ И ВЫХОД ЦАП (СЕНСОРЫ мА ИЛИ В)
+  PUB_DISC("number", "damper", R"raw("name":"Actuator Target Open","unique_id":"eh_damper","state_topic":"asic/damper/state","command_topic":"asic/damper/set","min":0,"max":100,"unit_of_measurement":"%","icon":"mdi:fan")raw");
+  PUB_DISC("sensor", "actuator_ma", R"raw("name":"Valve Current Output (Io2)","unique_id":"eh_damper_ma","state_topic":"asic/actuator/current_ma/state","unit_of_measurement":"mA","icon":"mdi:current-ac")raw");
+  PUB_DISC("sensor", "actuator_v", R"raw("name":"Dry Cooler Voltage Output (Vo2)","unique_id":"eh_damper_v","state_topic":"asic/actuator/voltage_v/state","unit_of_measurement":"V","icon":"mdi:sine-wave")raw");
   PUB_DISC("sensor", "press", R"raw("name":"Pressure","unique_id":"eh_press","state_topic":"asic/sensor/pressure/state","unit_of_measurement":"bar","device_class":"pressure")raw");
   PUB_DISC("sensor", "t_in", R"raw("name":"Temp IN","unique_id":"eh_tin","state_topic":"asic/sensor/temp_in/state","unit_of_measurement":"°C","device_class":"temperature")raw");
   PUB_DISC("sensor", "t_out", R"raw("name":"Temp OUT","unique_id":"eh_tout","state_topic":"asic/sensor/temp_out/state","unit_of_measurement":"°C","device_class":"temperature")raw");
@@ -582,7 +633,7 @@ void sendHADiscovery() {
 void setupWebOTA() {
   server.on("/", HTTP_GET, [](){
     if (!server.authenticate(http_username, http_password)) return server.requestAuthentication();
-    const char html[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><title>ASIC OTA</title><meta charset='utf-8'></head><body><h2>⚡ ASIC Hydro Controller (v3.6.2 Safe Boot)</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button type='submit'>Upload</button></form></body></html>)rawliteral";
+    const char html[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><title>ASIC OTA</title><meta charset='utf-8'></head><body><h2>⚡ ASIC Hydro Controller (v3.8.0)</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button type='submit'>Upload</button></form></body></html>)rawliteral";
     server.send(200, "text/html", html);
   });
   
@@ -614,11 +665,6 @@ void setup() {
   pinMode(PIN_SER_74HC595, OUTPUT); pinMode(PIN_RCLK_74HC595, OUTPUT); pinMode(PIN_SRCLK_74HC595, OUTPUT);
   pinMode(PIN_QH_74HC165, INPUT); pinMode(PIN_CLK_74HC165, OUTPUT); pinMode(PIN_SH_74HC165, OUTPUT);
 
-  // ⚡ КРИТИЧЕСКИЙ БЕЗОПАСНЫЙ СТАРТ ЗАСЛОНКИ: Подаем 4.00 мА (0%) сразу
-  applyDamperDAC(0.0f);
-  currentDamperPercent = 0.0f;
-  targetDamperPercent = 0.0f;
-
   relayStateMask = 0x00; 
   sendByteRelay();
 
@@ -633,7 +679,13 @@ void setup() {
   isForceManual = preferences.getBool("pid_force_man", false);
   isPidEnabled = isForceManual ? false : preferences.getBool("pid_enable", false);
   pidSetpoint = preferences.getFloat("pid_setpoint", 42.0f);
+  currentProfile = (OutputProfile)preferences.getUChar("out_profile", (uint8_t)PROFILE_VALVE_4_20MA);
   preferences.end();
+
+  // БЕЗОПАСНЫЙ СТАРТ В ВЫБРАННОМ РЕЖИМЕ (4.00 мА или 0.00 В)
+  applyDamperDAC(0.0f);
+  currentDamperPercent = 0.0f;
+  targetDamperPercent = 0.0f;
 
   hydroPID.SetOutputLimits(0, 100);
   hydroPID.SetSampleTimeUs(PID_COMPUTE_INTERVAL * 1000);
@@ -690,6 +742,7 @@ void loop() {
     publishAllRelayStates();
     publishSystemMode();
     publishPidStatus();
+    publishProfileStatus();
     publishRevertTimer();
     setDamperPercent(targetDamperPercent, false);
     needPublishAllStates = false;
@@ -718,6 +771,7 @@ void loop() {
   if (isMqttConnected && now - lastRelayStatusPublish >= RELAY_STATUS_INTERVAL) {
     publishAllRelayStates();
     publishPidStatus();
+    publishProfileStatus();
     lastRelayStatusPublish = now;
   }
 
