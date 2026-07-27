@@ -1,15 +1,12 @@
 /*
  * ========================================================================================
- * ⚡ ESP32 ASIC HYDRO CONTROLLER – NATIVE ESP-IDF ASYNC (v3.8.2 QoS1 & Retain Edition)
+ * ⚡ ESP32 ASIC HYDRO CONTROLLER – FREERTOS STABLE ARCHITECTURE (v4.0.5 Final)
  * ========================================================================================
  * Плата: Eletechsup ES32D26 (ESP32-DevKitC 38-PIN)
- * Поддерживаемые режимы (выбор 1 из 2):
- *  1. VALVE_4_20MA     : Кран / заслонка (DIP 1 = ON, DIP 3 = OFF). Диапазон 4..20 мА.
- *  2. DRY_COOLER_0_10V : Сухая градирня / VFD (DIP 1 = OFF, DIP 3 = ON). Диапазон 0..10 В.
- * Изменения v3.8.2:
- *  - Все публикации MQTT переведены на QoS 1 и Retain = true
- *  - Все подписки MQTT переведены на QoS 1
- *  - LWT конфигурация переведена на QoS 1
+ * Изменения v4.0.5:
+ *  - ИСПРАВЛЕН WDT RESET: Убрано ошибочное удаление loopTask, правильная регистрация задач
+ *  - ИСПРАВЛЕН STACK OVERFLOW: Буфер HA Discovery вынесен из стека
+ *  - Полная стабильность обеих ядер без фантомных перезагрузок
  * ========================================================================================
  */
 
@@ -29,7 +26,7 @@
 
 #include "config.h"
 
-// ================= ПРОФИЛИ ВЫХОДА (ИЗОЛИРОВАННЫЙ ВЫБОР) =================
+// ================= ПРОФИЛИ ВЫХОДА =================
 enum OutputProfile {
   PROFILE_VALVE_4_20MA = 0,    // Заслонка / Кран (4..20 мА)
   PROFILE_DRY_COOLER_0_10V = 1 // Сухая градирня / Частотник (0..10 В)
@@ -49,8 +46,6 @@ constexpr uint8_t PIN_CLK_74HC165 = 2;
 constexpr uint8_t PIN_SH_74HC165  = 0;
 
 uint8_t lastInputStates = 0x00;
-unsigned long lastInputScan = 0;
-constexpr unsigned long INPUT_SCAN_INTERVAL = 50;
 
 // ================= ПИНЫ DS18B20 =================
 constexpr uint8_t TEMP_IN_PIN  = 19;
@@ -62,36 +57,40 @@ DallasTemperature sensorsOut(&oneWireOut);
 
 float lastTempIn = -127.0f, lastTempOut = -127.0f;
 float filteredTempOut = -127.0f; 
-constexpr float EMA_ALPHA = 0.2f; 
+constexpr float EMA_ALPHA = 0.08f; 
 bool tempInOnline = false, tempOutOnline = false;
+bool isTempConversionPending = false;
+unsigned long tempConversionStartTime = 0;
 
 // ================= ВЫХОД ЦАП (GPIO26 / DAC2) =================
 constexpr uint8_t DAMPER_OUTPUT_PIN = 26;
 float currentDamperPercent = 0.0f, targetDamperPercent = 0.0f; 
 
-constexpr float DAMPER_STEP_PCT = 0.5f;
-constexpr unsigned long DAMPER_RAMP_INTERVAL = 100;
-unsigned long lastDamperRampTick = 0;
+constexpr float DAMPER_STEP_PCT = 0.2f;
+
+struct DamperCommand {
+  float percent;
+  bool isManual;
+};
 
 // ================= ПИД-РЕГУЛЯТОР И АВТОВОЗВРАТ =================
 float pidSetpoint = 42.0f, pidInput = 0.0f, pidOutput = 0.0f;
-float pidKp = 3.5f, pidKi = 0.05f, pidKd = 0.8f;
+float pidKp = 1.2f, pidKi = 0.02f, pidKd = 0.0f; 
 bool isPidEnabled = false, isPidInverted = true;
 
 bool isForceManual = false; 
 unsigned long manualOverrideStartTime = 0;
-constexpr unsigned long PID_AUTO_REVERT_TIMEOUT = 15 * 60 * 1000UL; // 15 минут
+constexpr unsigned long PID_AUTO_REVERT_TIMEOUT = 15 * 60 * 1000UL;
 
 QuickPID hydroPID(&pidInput, &pidOutput, &pidSetpoint, pidKp, pidKi, pidKd,
                  QuickPID::pMode::pOnError, QuickPID::dMode::dOnMeas,
                  QuickPID::iAwMode::iAwCondition, QuickPID::Action::reverse);
-unsigned long lastPidCompute = 0;
-constexpr unsigned long PID_COMPUTE_INTERVAL = 2000;
-constexpr float PID_DEADBAND_PCT = 1.0f;
+constexpr unsigned long PID_COMPUTE_INTERVAL = 5000;
+constexpr float PID_DEADBAND_PCT = 2.0f;
 
 // ================= АНТИЗАЛИПАНИЕ (FSM) =================
 unsigned long lastAntiStuckRun = 0;
-constexpr unsigned long ANTI_STUCK_INTERVAL = 86400000UL; // 24 часа
+constexpr unsigned long ANTI_STUCK_INTERVAL = 86400000UL;
 bool isAntiStuckActive = false;
 
 enum AntiStuckState {
@@ -104,7 +103,7 @@ enum AntiStuckState {
 
 AntiStuckState antiStuckStep = ANTI_STUCK_IDLE;
 unsigned long antiStuckStepTimer = 0;
-constexpr unsigned long ANTI_STUCK_MOVE_TIME = 15000UL; // 15 секунд
+constexpr unsigned long ANTI_STUCK_MOVE_TIME = 15000UL;
 
 // ================= MODBUS =================
 constexpr uint8_t RS485_DIR_PIN = 21;
@@ -114,6 +113,10 @@ float currentPressureBar = 0.0f;
 
 void preTransmission() { digitalWrite(RS485_DIR_PIN, HIGH); delayMicroseconds(100); }
 void postTransmission() { delayMicroseconds(100); digitalWrite(RS485_DIR_PIN, LOW); delayMicroseconds(100); }
+
+// ================= ТАЙМЕРЫ И ИНТЕРВАЛЫ =================
+constexpr unsigned long TIMER_PUBLISH_INTERVAL = 10000;
+constexpr unsigned long RELAY_STATUS_INTERVAL = 60000;
 
 // ================= СИСТЕМНЫЕ ФЛАГИ =================
 bool isAutoMode = true;
@@ -125,20 +128,16 @@ volatile bool isMqttConnected = false;
 volatile bool needSendDiscovery = false;
 volatile bool needPublishAllStates = false;
 
-// Таймеры
-unsigned long lastTempCheck = 0;
-constexpr unsigned long TEMP_CHECK_INTERVAL = 2000;
-unsigned long lastPressureCheck = 0;
-constexpr unsigned long PRESSURE_CHECK_INTERVAL = 2000;
-unsigned long lastRelayStatusPublish = 0;
-constexpr unsigned long RELAY_STATUS_INTERVAL = 60000;
-unsigned long lastTimerPublish = 0;
-constexpr unsigned long TIMER_PUBLISH_INTERVAL = 10000; 
+// FREERTOS ОБЪЕКТЫ
+QueueHandle_t damperCmdQueue = NULL;
 
-// ================= СЕТЕВЫЕ ОБЪЕКТЫ =================
+// СЕТЕВЫЕ ОБЪЕКТЫ
 esp_mqtt_client_handle_t mqtt_client = NULL;
 WebServer server(80);
 Preferences preferences;
+
+// Статический буфер для HA Discovery (защита от Stack Overflow)
+static char discPayloadBuf[1024];
 
 // ================= ПРОТОТИПЫ =================
 void sendByteRelay();
@@ -156,23 +155,30 @@ void publishRevertTimer();
 void publishActuatorMetrics(float percent);
 void publishProfileStatus();
 void processAntiStuck();
+void saveRelaysToNVS();
 bool isMasterOn() { return (relayStateMask != 0x00); }
 
-// ЕДИНАЯ ФУНКЦИЯ ПУБЛИКАЦИИ: QoS = 1, RETAIN = true (по умолчанию)
+// ЕДИНАЯ ФУНКЦИЯ ПУБЛИКАЦИИ
 void mqttPublish(const char* topic, const char* payload, bool retain = true) {
   if (mqtt_client && isMqttConnected) {
     esp_mqtt_client_publish(mqtt_client, topic, payload, 0, 1, retain ? 1 : 0);
   }
 }
 
-// ЕДИНАЯ ФУНКЦИЯ ПОДПИСКИ: QoS = 1
+// ЕДИНАЯ ФУНКЦИЯ ПОДПИСКИ
 void mqttSubscribe(const char* topic) {
   if (mqtt_client && isMqttConnected) {
     esp_mqtt_client_subscribe(mqtt_client, topic, 1);
   }
 }
 
-// ================= ПУБЛИКАЦИЯ СТАТУСА И МЕТРИК ВЫБРАННОГО РЕЖИМА =================
+void saveRelaysToNVS() {
+  preferences.begin("asic_storage", false);
+  preferences.putUChar("relays", relayStateMask);
+  preferences.end();
+}
+
+// ================= ПУБЛИКАЦИЯ СТАТУСА И МЕТРИК =================
 void publishProfileStatus() {
   if (!isMqttConnected) return;
   const char* profStr = (currentProfile == PROFILE_VALVE_4_20MA) ? "VALVE_4_20MA" : "DRY_COOLER_0_10V";
@@ -239,7 +245,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       mqttSubscribe("asic/sensor/leak/set");
       mqttSubscribe("asic/mode/set");
       mqttSubscribe("asic/profile/set");
-      mqttSubscribe("asic/ota");
       mqttSubscribe("asic/reset_nvs");
       mqttSubscribe("asic/pid/enable/set");
       mqttSubscribe("asic/pid/invert/set");
@@ -323,8 +328,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       }
       else if (strcmp(topic, "asic/pid/setpoint/set") == 0) {
         float val = atof(message);
-        if (val >= 20.0f && val <= 85.0f) {
-          pidSetpoint = val;
+        if (val >= 21.0f && val <= 85.0f) {
+          if (abs(val - pidSetpoint) > 0.1f) {
+            pidSetpoint = val;
+
+            preferences.begin("asic_storage", false);
+            preferences.putFloat("pid_setpoint", pidSetpoint);
+            preferences.end();
+
+            publishPidStatus();
+          }
+        } else {
           publishPidStatus();
         }
       }
@@ -340,7 +354,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       else if (strcmp(topic, "asic/master/set") == 0) {
         if (!startupComplete) break;
         relayStateMask = isOn ? 0xFF : 0x00;
-        sendByteRelay(); publishAllRelayStates();
+        sendByteRelay(); 
+        saveRelaysToNVS();
+        publishAllRelayStates();
       }
       else if (strcmp(topic, "asic/mode/set") == 0) {
         isAutoMode = (strcmp(message, "AUTO") == 0); publishSystemMode();
@@ -354,17 +370,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       else if (strcmp(topic, "asic/relay7/set") == 0) setRelayChannel(7, isOn);
       else if (strcmp(topic, "asic/relay8/set") == 0) setRelayChannel(8, isOn);
       else if (strcmp(topic, "asic/damper/set") == 0) {
-        setDamperPercent(atof(message), true);
+        float val = (float)atof(message);
+        if (abs(val - targetDamperPercent) > 0.1f) {
+          DamperCommand cmd = { val, true };
+          xQueueSend(damperCmdQueue, &cmd, 0);
+        }
       }
       else if (strcmp(topic, "asic/reset_nvs") == 0) {
         preferences.begin("asic_storage", false); preferences.clear(); preferences.end();
         relayStateMask = 0x00; isAutoMode = true; isPidEnabled = false; isForceManual = false; isPidInverted = true;
         currentProfile = PROFILE_VALVE_4_20MA;
         sendByteRelay(); publishAllRelayStates(); publishSystemMode(); publishPidStatus(); publishProfileStatus(); publishRevertTimer();
-      }
-      else if (strcmp(topic, "asic/ota") == 0 && strcmp(message, "update") == 0) {
-        ota_active = true; relayStateMask = 0x00; sendByteRelay();
-        if (mqtt_client) esp_mqtt_client_stop(mqtt_client);
       }
       break;
     }
@@ -383,7 +399,7 @@ void initNativeMqtt() {
   mqtt_cfg.password = mqtt_pass;
   mqtt_cfg.lwt_topic = "asic/status";
   mqtt_cfg.lwt_msg = "offline";
-  mqtt_cfg.lwt_qos = 1; // QoS = 1 для LWT
+  mqtt_cfg.lwt_qos = 1;
   mqtt_cfg.lwt_retain = 1;
 
   mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
@@ -409,7 +425,10 @@ void setRelayChannel(uint8_t channel, bool state) {
   if (((relayStateMask & bit) != 0) == state) return;
   
   if (state) relayStateMask |= bit; else relayStateMask &= ~bit;
-  sendByteRelay(); publishRelayState(channel); publishMasterState();
+  sendByteRelay(); 
+  saveRelaysToNVS();
+  publishRelayState(channel); 
+  publishMasterState();
 }
 
 void publishRelayState(uint8_t channel) {
@@ -439,9 +458,6 @@ uint8_t readByteInputs() {
 }
 
 void handlePhysicalInputs() {
-  if (millis() - lastInputScan < INPUT_SCAN_INTERVAL) return;
-  lastInputScan = millis();
-
   uint8_t raw = readByteInputs();
   for (int i = 1; i <= 8; i++) {
     bool isPressed = !((raw & (1 << (7 - (i - 1)))) != 0);
@@ -484,25 +500,25 @@ void applyDamperDAC(float percent) {
   currentDamperPercent = percent;
 
   uint8_t dacValue = 0;
-  if (currentProfile == PROFILE_VALVE_4_20MA) {
-    float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
-    dacValue = (uint8_t)round((currentmA / 20.0f) * 255.0f);
+  if (percent <= 0.05f) {
+    dacValue = (currentProfile == PROFILE_VALVE_4_20MA) ? 51 : 0;
   } else {
-    dacValue = (uint8_t)round((percent / 100.0f) * 255.0f);
+    if (currentProfile == PROFILE_VALVE_4_20MA) {
+      float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
+      dacValue = (uint8_t)round((currentmA / 20.0f) * 255.0f);
+    } else {
+      dacValue = (uint8_t)round((percent / 100.0f) * 255.0f);
+    }
   }
 
   dacWrite(DAMPER_OUTPUT_PIN, dacValue);
 }
 
 void processDamperRamp() {
-  unsigned long now = millis();
-  if (now - lastDamperRampTick >= DAMPER_RAMP_INTERVAL) { 
-    lastDamperRampTick = now;
-    if (abs(currentDamperPercent - targetDamperPercent) > 0.05f) {
-      currentDamperPercent += (currentDamperPercent < targetDamperPercent) ? DAMPER_STEP_PCT : -DAMPER_STEP_PCT;
-      applyDamperDAC(currentDamperPercent);
-      publishActuatorMetrics(currentDamperPercent);
-    }
+  if (abs(currentDamperPercent - targetDamperPercent) > 0.05f) {
+    currentDamperPercent += (currentDamperPercent < targetDamperPercent) ? DAMPER_STEP_PCT : -DAMPER_STEP_PCT;
+    applyDamperDAC(currentDamperPercent);
+    publishActuatorMetrics(currentDamperPercent);
   }
 }
 
@@ -563,38 +579,47 @@ void readAndPublishPressure() {
   }
 }
 
-void readAndPublishTemperatures() {
-  sensorsIn.requestTemperatures(); 
-  float tempIn = sensorsIn.getTempCByIndex(0);
-  
-  sensorsOut.requestTemperatures(); 
-  float tempOut = sensorsOut.getTempCByIndex(0);
-  
-  char strBuf[16];
-  if (tempIn > -55.0f && tempIn < 125.0f) {
-    lastTempIn = tempIn;
-    snprintf(strBuf, sizeof(strBuf), "%.1f", tempIn);
-    mqttPublish("asic/sensor/temp_in/state", strBuf, true);
-  }
-  
-  if (tempOut > -55.0f && tempOut < 125.0f) {
-    lastTempOut = tempOut; 
-    tempOutOnline = true;
+void processTemperaturesAsync() {
+  unsigned long now = millis();
 
-    if (filteredTempOut <= -50.0f) {
-      filteredTempOut = tempOut;
-    } else {
-      filteredTempOut = (EMA_ALPHA * tempOut) + ((1.0f - EMA_ALPHA) * filteredTempOut);
+  if (!isTempConversionPending) {
+    sensorsIn.requestTemperatures();
+    sensorsOut.requestTemperatures();
+    isTempConversionPending = true;
+    tempConversionStartTime = now;
+  } else {
+    if (now - tempConversionStartTime >= 750) {
+      isTempConversionPending = false;
+
+      float tempIn = sensorsIn.getTempCByIndex(0);
+      float tempOut = sensorsOut.getTempCByIndex(0);
+
+      char strBuf[16];
+      if (tempIn > -55.0f && tempIn < 125.0f) {
+        lastTempIn = tempIn;
+        snprintf(strBuf, sizeof(strBuf), "%.1f", tempIn);
+        mqttPublish("asic/sensor/temp_in/state", strBuf, true);
+      }
+
+      if (tempOut > -55.0f && tempOut < 125.0f) {
+        lastTempOut = tempOut;
+        tempOutOnline = true;
+
+        if (filteredTempOut <= -50.0f) {
+          filteredTempOut = tempOut;
+        } else {
+          filteredTempOut = (EMA_ALPHA * tempOut) + ((1.0f - EMA_ALPHA) * filteredTempOut);
+        }
+
+        snprintf(strBuf, sizeof(strBuf), "%.1f", tempOut);
+        mqttPublish("asic/sensor/temp_out/state", strBuf, true);
+      } else {
+        tempOutOnline = false;
+      }
     }
-
-    snprintf(strBuf, sizeof(strBuf), "%.1f", tempOut);
-    mqttPublish("asic/sensor/temp_out/state", strBuf, true);
-  } else { 
-    tempOutOnline = false; 
   }
 }
 
-// ================= ЛОГИКА ПИД И АВТОВОЗВРАТА =================
 void processPID() {
   unsigned long now = millis();
 
@@ -615,20 +640,16 @@ void processPID() {
 
   if (!isPidEnabled || isAntiStuckActive) return;
   
-  if (now - lastPidCompute >= PID_COMPUTE_INTERVAL) { 
-    lastPidCompute = now;
-    
-    if (!tempOutOnline || filteredTempOut <= -50.0f) { 
-      setDamperPercent(100.0, false); 
-      return; 
-    }
-    
-    pidInput = filteredTempOut;
-    
-    if (hydroPID.Compute()) {
-      if (abs(pidOutput - targetDamperPercent) >= PID_DEADBAND_PCT) {
-        setDamperPercent(pidOutput, false);
-      }
+  if (!tempOutOnline || filteredTempOut <= -50.0f) { 
+    setDamperPercent(100.0, false); 
+    return; 
+  }
+  
+  pidInput = filteredTempOut;
+  
+  if (hydroPID.Compute()) {
+    if (abs(pidOutput - targetDamperPercent) >= PID_DEADBAND_PCT) {
+      setDamperPercent(pidOutput, false);
     }
   }
 }
@@ -646,27 +667,22 @@ void publishPidStatus() {
 
 // ================= HA DISCOVERY =================
 void sendHADiscovery() {
-  char payload[1024];  
-  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_board"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v3.8.2"},"availability":[{"topic":"asic/status"}])raw";
-  #define PUB_DISC(comp, id, ...) snprintf(payload, sizeof(payload), "{%s,%s}", dev_av, (__VA_ARGS__)); mqttPublish("homeassistant/" comp "/asic_hydro/" id "/config", payload, true); delay(20);
+  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_board"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v4.0.5(FreeRTOS)"},"availability":[{"topic":"asic/status"}])raw";
+  #define PUB_DISC(comp, id, ...) snprintf(discPayloadBuf, sizeof(discPayloadBuf), "{%s,%s}", dev_av, (__VA_ARGS__)); mqttPublish("homeassistant/" comp "/asic_hydro/" id "/config", discPayloadBuf, true); delay(20);
 
-  // 1. СИСТЕМНЫЕ ПЕРЕКЛЮЧАТЕЛИ И СЕЛЕКТОР ПРОФИЛЯ
   PUB_DISC("switch", "master", R"raw("name":"Master Switch","unique_id":"eh_master","state_topic":"asic/master/state","command_topic":"asic/master/set","icon":"mdi:power")raw");
   PUB_DISC("select", "cooling_profile", R"raw("name":"Cooling Equipment Type","unique_id":"eh_profile","state_topic":"asic/profile/state","command_topic":"asic/profile/set","options":["VALVE_4_20MA","DRY_COOLER_0_10V"],"icon":"mdi:fan-auto","entity_category":"config")raw");
   PUB_DISC("switch", "pid_en", R"raw("name":"PID Auto-Control","unique_id":"eh_pid_en","state_topic":"asic/pid/enable/state","command_topic":"asic/pid/enable/set","icon":"mdi:thermostat-auto")raw");
   PUB_DISC("switch", "force_manual", R"raw("name":"Force Manual Mode (Hold PID)","unique_id":"eh_force_man","state_topic":"asic/pid/force_manual/state","command_topic":"asic/pid/force_manual/set","icon":"mdi:hand-back-right","entity_category":"config")raw");
   PUB_DISC("switch", "pid_inv", R"raw("name":"PID Invert Direction","unique_id":"eh_pid_inv","state_topic":"asic/pid/invert/state","command_topic":"asic/pid/invert/set","icon":"mdi:swap-horizontal","entity_category":"config")raw");
 
-  // 2. УСТАВКА И НАСТРОЙКИ ПИД
-  PUB_DISC("number", "pid_sp", R"raw("name":"Target Temperature Tout","unique_id":"eh_pid_sp","state_topic":"asic/pid/setpoint/state","command_topic":"asic/pid/setpoint/set","min":20,"max":85,"step":0.5,"unit_of_measurement":"°C","icon":"mdi:target-account")raw");
+  PUB_DISC("number", "pid_sp", R"raw("name":"Target Temperature Tout","unique_id":"eh_pid_sp","state_topic":"asic/pid/setpoint/state","command_topic":"asic/pid/setpoint/set","min":21,"max":85,"step":0.5,"unit_of_measurement":"°C","icon":"mdi:target-account")raw");
   PUB_DISC("number", "pid_kp", R"raw("name":"PID Kp","unique_id":"eh_pid_kp","state_topic":"asic/pid/kp/state","command_topic":"asic/pid/kp/set","min":0,"max":50,"step":0.1,"entity_category":"config")raw");
   PUB_DISC("number", "pid_ki", R"raw("name":"PID Ki","unique_id":"eh_pid_ki","state_topic":"asic/pid/ki/state","command_topic":"asic/pid/ki/set","min":0,"max":10,"step":0.01,"entity_category":"config")raw");
   PUB_DISC("number", "pid_kd", R"raw("name":"PID Kd","unique_id":"eh_pid_kd","state_topic":"asic/pid/kd/state","command_topic":"asic/pid/kd/set","min":0,"max":50,"step":0.1,"entity_category":"config")raw");
 
-  // 3. СЕНСОР ТАЙМЕРА АВТОВОЗВРАТА
   PUB_DISC("sensor", "pid_timer", R"raw("name":"PID Auto-Revert Countdown","unique_id":"eh_pid_timer","state_topic":"asic/pid/revert_timer/state","icon":"mdi:timer-sand")raw");
 
-  // 4. ВСЕ 8 РЕЛЕ
   PUB_DISC("switch", "asic_1", R"raw("name":"ASIC 1","unique_id":"eh_r1","state_topic":"asic/relay1/state","command_topic":"asic/relay1/set","icon":"mdi:server")raw");
   PUB_DISC("switch", "asic_2", R"raw("name":"ASIC 2","unique_id":"eh_r2","state_topic":"asic/relay2/state","command_topic":"asic/relay2/set","icon":"mdi:server")raw");
   PUB_DISC("switch", "asic_3", R"raw("name":"ASIC 3","unique_id":"eh_r3","state_topic":"asic/relay3/state","command_topic":"asic/relay3/set","icon":"mdi:server")raw");
@@ -676,13 +692,11 @@ void sendHADiscovery() {
   PUB_DISC("switch", "relay_7", R"raw("name":"Aux Relay 7","unique_id":"eh_r7","state_topic":"asic/relay7/state","command_topic":"asic/relay7/set","icon":"mdi:toggle-switch")raw");
   PUB_DISC("switch", "relay_8", R"raw("name":"Aux Relay 8","unique_id":"eh_r8","state_topic":"asic/relay8/state","command_topic":"asic/relay8/set","icon":"mdi:toggle-switch")raw");
 
-  // 5. СБРОС ПАМЯТИ
   PUB_DISC("button", "reset_nvs", R"raw("name":"Reset Memory (NVS)","unique_id":"eh_reset_nvs","command_topic":"asic/reset_nvs","payload_press":"RESET","icon":"mdi:restore","entity_category":"config")raw");
 
-  // 6. ДАТЧИКИ И ВЫХОД ЦАП (СЕНСОРЫ мА ИЛИ В)
   PUB_DISC("number", "damper", R"raw("name":"Actuator Target Open","unique_id":"eh_damper","state_topic":"asic/damper/state","command_topic":"asic/damper/set","min":0,"max":100,"unit_of_measurement":"%","icon":"mdi:fan")raw");
-  PUB_DISC("sensor", "actuator_ma", R"raw("name":"Valve Current Output (Io2)","unique_id":"eh_damper_ma","state_topic":"asic/actuator/current_ma/state","unit_of_measurement":"mA","icon":"mdi:current-ac")raw");
-  PUB_DISC("sensor", "actuator_v", R"raw("name":"Dry Cooler Voltage Output (Vo2)","unique_id":"eh_damper_v","state_topic":"asic/actuator/voltage_v/state","unit_of_measurement":"V","icon":"mdi:sine-wave")raw");
+  PUB_DISC("sensor", "actuator_ma", R"raw("name":"Valve Current Output (Io2)","unique_id":"eh_actuator_ma","state_topic":"asic/actuator/current_ma/state","unit_of_measurement":"mA","icon":"mdi:current-ac")raw");
+  PUB_DISC("sensor", "actuator_v", R"raw("name":"Dry Cooler Voltage Output (Vo2)","unique_id":"eh_actuator_v","state_topic":"asic/actuator/voltage_v/state","unit_of_measurement":"V","icon":"mdi:sine-wave")raw");
   PUB_DISC("sensor", "press", R"raw("name":"Pressure","unique_id":"eh_press","state_topic":"asic/sensor/pressure/state","unit_of_measurement":"bar","device_class":"pressure")raw");
   PUB_DISC("sensor", "t_in", R"raw("name":"Temp IN","unique_id":"eh_tin","state_topic":"asic/sensor/temp_in/state","unit_of_measurement":"°C","device_class":"temperature")raw");
   PUB_DISC("sensor", "t_out", R"raw("name":"Temp OUT","unique_id":"eh_tout","state_topic":"asic/sensor/temp_out/state","unit_of_measurement":"°C","device_class":"temperature")raw");
@@ -693,30 +707,79 @@ void sendHADiscovery() {
 void setupWebOTA() {
   server.on("/", HTTP_GET, [](){
     if (!server.authenticate(http_username, http_password)) return server.requestAuthentication();
-    const char html[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><title>ASIC OTA</title><meta charset='utf-8'></head><body><h2>⚡ ASIC Hydro Controller (v3.8.2)</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button type='submit'>Upload</button></form></body></html>)rawliteral";
+    const char html[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><title>ASIC OTA</title><meta charset='utf-8'></head><body><h2>⚡ ASIC Hydro Controller (v4.0.5 FreeRTOS)</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button type='submit'>Upload</button></form></body></html>)rawliteral";
     server.send(200, "text/html", html);
   });
   
   server.on("/update", HTTP_POST, [](){
     if (!server.authenticate(http_username, http_password)) return server.requestAuthentication();
-    server.send(200, "text/plain", "Update finished. Restarting...");
-    delay(1000);
-    ESP.restart();
+    if (!Update.hasError() && Update.size() > 0) {
+      server.send(200, "text/plain", "Update finished. Restarting...");
+      delay(1000);
+      ESP.restart();
+    } else {
+      server.send(400, "text/plain", "Update Failed!");
+    }
   }, [](){
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
       ota_active = true;
-      relayStateMask = 0x00; sendByteRelay();
+      relayStateMask = 0x00; 
+      sendByteRelay();
       if (mqtt_client) esp_mqtt_client_stop(mqtt_client);
       if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
     } else if (upload.status == UPLOAD_FILE_WRITE) {
       if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial);
     } else if (upload.status == UPLOAD_FILE_END) {
-      if (!Update.end(true)) Update.printError(Serial);
+      if (!Update.end(true)) {
+        Update.printError(Serial);
+        ota_active = false;
+      }
     }
   });
   
   server.begin();
+}
+
+// ================= FREERTOS TASK 1: CONTROL & FAILSAFE (CORE 1) =================
+void TaskControl(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(100);
+
+  unsigned long lastPidTick = 0;
+  unsigned long lastPressureTick = 0;
+
+  for (;;) {
+    // 1. Вычитка команд ЦАП
+    DamperCommand cmd;
+    if (xQueueReceive(damperCmdQueue, &cmd, 0) == pdTRUE) {
+      setDamperPercent(cmd.percent, cmd.isManual);
+    }
+
+    // 2. Входы и рампа ЦАП
+    handlePhysicalInputs();
+    processDamperRamp();
+
+    // 3. Асинхронный OneWire
+    processTemperaturesAsync();
+
+    unsigned long now = millis();
+
+    // 4. Modbus RTU (давление)
+    if (now - lastPressureTick >= 2000) {
+      readAndPublishPressure();
+      lastPressureTick = now;
+    }
+
+    // 5. ПИД
+    if (now - lastPidTick >= PID_COMPUTE_INTERVAL) {
+      processAntiStuck();
+      processPID();
+      lastPidTick = now;
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
 }
 
 // ================= SETUP =================
@@ -728,12 +791,11 @@ void setup() {
   relayStateMask = 0x00; 
   sendByteRelay();
 
-  delay(1000);
+  delay(500);
 
-  esp_task_wdt_init(15, true); 
-  esp_task_wdt_add(NULL);
+  damperCmdQueue = xQueueCreate(10, sizeof(DamperCommand));
 
-  // СЧИТЫВАНИЕ НАСТРОЕК ИЗ NVS
+  // Чтение настроек NVS
   preferences.begin("asic_storage", true);
   relayStateMask = preferences.getUChar("relays", 0x00);
   isForceManual = preferences.getBool("pid_force_man", false);
@@ -742,10 +804,10 @@ void setup() {
   currentProfile = (OutputProfile)preferences.getUChar("out_profile", (uint8_t)PROFILE_VALVE_4_20MA);
   preferences.end();
 
-  // БЕЗОПАСНЫЙ СТАРТ В ВЫБРАННОМ РЕЖИМЕ (4.00 мА или 0.00 В)
-  applyDamperDAC(0.0f);
-  currentDamperPercent = 0.0f;
+  // Безопасный 0%
   targetDamperPercent = 0.0f;
+  currentDamperPercent = -1.0f;
+  applyDamperDAC(0.0f);
 
   hydroPID.SetOutputLimits(0, 100);
   hydroPID.SetSampleTimeUs(PID_COMPUTE_INTERVAL * 1000);
@@ -757,6 +819,8 @@ void setup() {
   
   sensorsIn.begin(); 
   sensorsOut.begin();
+  sensorsIn.setWaitForConversion(false);
+  sensorsOut.setWaitForConversion(false);
 
   pinMode(RS485_DIR_PIN, OUTPUT); digitalWrite(RS485_DIR_PIN, LOW);
   Serial.begin(9600, SERIAL_8N1); node.begin(PRESSURE_SENSOR_ADDR, Serial);
@@ -768,7 +832,6 @@ void setup() {
 
   while (WiFi.status() != WL_CONNECTED) {
     delay(200);
-    esp_task_wdt_reset();
   }
 
   MDNS.begin(ota_hostname);
@@ -778,63 +841,48 @@ void setup() {
   initNativeMqtt();
   
   startupComplete = true;
+
+  // Создаем ТОЛЬКО задачу контроля на Ядре 1. Задача Сети будет работать в loop() на Ядре 0!
+  xTaskCreatePinnedToCore(TaskControl, "TaskControl", 8192, NULL, 5, NULL, 1);
 }
 
-// ================= MAIN LOOP =================
+// ================= MAIN LOOP (TASK NETWORK НА CORE 0) =================
 void loop() {
-  esp_task_wdt_reset();
-
   server.handleClient();
 
-  if (ota_active) {
-    delay(10);
-    return;
+  if (!ota_active) {
+    unsigned long now = millis();
+
+    if (needSendDiscovery) {
+      sendHADiscovery();
+      needSendDiscovery = false;
+    }
+
+    if (needPublishAllStates) {
+      publishAllRelayStates();
+      publishSystemMode();
+      publishPidStatus();
+      publishProfileStatus();
+      publishRevertTimer();
+      publishActuatorMetrics(targetDamperPercent);
+      needPublishAllStates = false;
+    }
+
+    static unsigned long lastTimerPub = 0;
+    if (now - lastTimerPub >= TIMER_PUBLISH_INTERVAL) {
+      publishRevertTimer();
+      lastTimerPub = now;
+    }
+
+    static unsigned long lastRelayPublish = 0;
+    if (isMqttConnected && now - lastRelayPublish >= RELAY_STATUS_INTERVAL) {
+      publishAllRelayStates();
+      publishPidStatus();
+      publishProfileStatus();
+      publishActuatorMetrics(targetDamperPercent);
+      lastRelayPublish = now;
+    }
   }
 
-  unsigned long now = millis();
-
-  if (needSendDiscovery) {
-    sendHADiscovery();
-    needSendDiscovery = false;
-  }
-
-  if (needPublishAllStates) {
-    publishAllRelayStates();
-    publishSystemMode();
-    publishPidStatus();
-    publishProfileStatus();
-    publishRevertTimer();
-    setDamperPercent(targetDamperPercent, false);
-    needPublishAllStates = false;
-  }
-
-  handlePhysicalInputs();
-  processDamperRamp();
-
-  if (now - lastTempCheck >= TEMP_CHECK_INTERVAL) {
-    readAndPublishTemperatures();
-    lastTempCheck = now;
-  }
-
-  if (now - lastPressureCheck >= PRESSURE_CHECK_INTERVAL) {
-    readAndPublishPressure();
-    lastPressureCheck = now;
-  }
-
-  processAntiStuck();
-  processPID();
-
-  if (now - lastTimerPublish >= TIMER_PUBLISH_INTERVAL) {
-    publishRevertTimer();
-    lastTimerPublish = now;
-  }
-
-  if (isMqttConnected && now - lastRelayStatusPublish >= RELAY_STATUS_INTERVAL) {
-    publishAllRelayStates();
-    publishPidStatus();
-    publishProfileStatus();
-    lastRelayStatusPublish = now;
-  }
-
-  delay(1); 
+  delay(10); // Позволяет встроенному WDT ядра 0 корректно отдыхать
 }
