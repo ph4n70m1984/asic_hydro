@@ -1,12 +1,15 @@
 /*
  * ========================================================================================
- * ⚡ ESP32 ASIC HYDRO CONTROLLER – FREERTOS STABLE ARCHITECTURE (v4.0.5 Final)
+ * ⚡ ESP32 ASIC HYDRO CONTROLLER – FREERTOS STABLE (v4.1.3 Toggle Switch Edition)
  * ========================================================================================
  * Плата: Eletechsup ES32D26 (ESP32-DevKitC 38-PIN)
- * Изменения v4.0.5:
- *  - ИСПРАВЛЕН WDT RESET: Убрано ошибочное удаление loopTask, правильная регистрация задач
- *  - ИСПРАВЛЕН STACK OVERFLOW: Буфер HA Discovery вынесен из стека
- *  - Полная стабильность обеих ядер без фантомных перезагрузок
+ * 
+ * Особенности v4.1.3:
+ *  - ТУМБЛЕРЫ С ФИКСАЦИЕЙ (Проходной режим): Любое переключение тумблера инвертирует
+ *    состояние канала, синхронизируя работу с веб-интерфейсом и MQTT.
+ *  - СТАРТОВАЯ ИНИЦИАЛИЗАЦИЯ: Начальное положение тумблеров фиксируется при загрузке.
+ *  - БЕЗУСЛОВНОЕ ВЫКЛЮЧЕНИЕ: Аварийное отключение реле доступно всегда.
+ *  - ПОЛНАЯ СТАБИЛЬНОСТЬ: Классический ПИД v3.8.2 + FreeRTOS Dual Core + Web OTA.
  * ========================================================================================
  */
 
@@ -57,7 +60,7 @@ DallasTemperature sensorsOut(&oneWireOut);
 
 float lastTempIn = -127.0f, lastTempOut = -127.0f;
 float filteredTempOut = -127.0f; 
-constexpr float EMA_ALPHA = 0.08f; 
+constexpr float EMA_ALPHA = 0.2f; 
 bool tempInOnline = false, tempOutOnline = false;
 bool isTempConversionPending = false;
 unsigned long tempConversionStartTime = 0;
@@ -66,7 +69,7 @@ unsigned long tempConversionStartTime = 0;
 constexpr uint8_t DAMPER_OUTPUT_PIN = 26;
 float currentDamperPercent = 0.0f, targetDamperPercent = 0.0f; 
 
-constexpr float DAMPER_STEP_PCT = 0.2f;
+constexpr float DAMPER_STEP_PCT = 0.5f; 
 
 struct DamperCommand {
   float percent;
@@ -75,8 +78,8 @@ struct DamperCommand {
 
 // ================= ПИД-РЕГУЛЯТОР И АВТОВОЗВРАТ =================
 float pidSetpoint = 42.0f, pidInput = 0.0f, pidOutput = 0.0f;
-float pidKp = 1.2f, pidKi = 0.02f, pidKd = 0.0f; 
-bool isPidEnabled = false, isPidInverted = true;
+float pidKp = 3.5f, pidKi = 0.05f, pidKd = 0.8f; 
+bool isPidEnabled = false, isPidInverted = true; 
 
 bool isForceManual = false; 
 unsigned long manualOverrideStartTime = 0;
@@ -85,8 +88,10 @@ constexpr unsigned long PID_AUTO_REVERT_TIMEOUT = 15 * 60 * 1000UL;
 QuickPID hydroPID(&pidInput, &pidOutput, &pidSetpoint, pidKp, pidKi, pidKd,
                  QuickPID::pMode::pOnError, QuickPID::dMode::dOnMeas,
                  QuickPID::iAwMode::iAwCondition, QuickPID::Action::reverse);
-constexpr unsigned long PID_COMPUTE_INTERVAL = 5000;
-constexpr float PID_DEADBAND_PCT = 2.0f;
+
+unsigned long lastPidCompute = 0;
+constexpr unsigned long PID_COMPUTE_INTERVAL = 2000;
+constexpr float PID_DEADBAND_PCT = 1.0f;
 
 // ================= АНТИЗАЛИПАНИЕ (FSM) =================
 unsigned long lastAntiStuckRun = 0;
@@ -136,7 +141,7 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
 WebServer server(80);
 Preferences preferences;
 
-// Статический буфер для HA Discovery (защита от Stack Overflow)
+// Статический буфер для HA Discovery
 static char discPayloadBuf[1024];
 
 // ================= ПРОТОТИПЫ =================
@@ -156,6 +161,7 @@ void publishActuatorMetrics(float percent);
 void publishProfileStatus();
 void processAntiStuck();
 void saveRelaysToNVS();
+uint8_t readByteInputs();
 bool isMasterOn() { return (relayStateMask != 0x00); }
 
 // ЕДИНАЯ ФУНКЦИЯ ПУБЛИКАЦИИ
@@ -324,21 +330,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       else if (strcmp(topic, "asic/pid/invert/set") == 0) {
         isPidInverted = isOn;
         hydroPID.SetControllerDirection(isPidInverted ? QuickPID::Action::reverse : QuickPID::Action::direct);
+        
+        preferences.begin("asic_storage", false);
+        preferences.putBool("pid_inv", isPidInverted);
+        preferences.end();
+
         publishPidStatus();
       }
       else if (strcmp(topic, "asic/pid/setpoint/set") == 0) {
         float val = atof(message);
-        if (val >= 21.0f && val <= 85.0f) {
-          if (abs(val - pidSetpoint) > 0.1f) {
-            pidSetpoint = val;
-
-            preferences.begin("asic_storage", false);
-            preferences.putFloat("pid_setpoint", pidSetpoint);
-            preferences.end();
-
-            publishPidStatus();
-          }
-        } else {
+        if (val >= 20.0f && val <= 85.0f) {
+          pidSetpoint = val;
+          preferences.begin("asic_storage", false);
+          preferences.putFloat("pid_setpoint", pidSetpoint);
+          preferences.end();
           publishPidStatus();
         }
       }
@@ -371,10 +376,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       else if (strcmp(topic, "asic/relay8/set") == 0) setRelayChannel(8, isOn);
       else if (strcmp(topic, "asic/damper/set") == 0) {
         float val = (float)atof(message);
-        if (abs(val - targetDamperPercent) > 0.1f) {
-          DamperCommand cmd = { val, true };
-          xQueueSend(damperCmdQueue, &cmd, 0);
-        }
+        DamperCommand cmd = { val, true };
+        xQueueSend(damperCmdQueue, &cmd, 0);
       }
       else if (strcmp(topic, "asic/reset_nvs") == 0) {
         preferences.begin("asic_storage", false); preferences.clear(); preferences.end();
@@ -457,16 +460,20 @@ uint8_t readByteInputs() {
   return input_byte;
 }
 
+// ПРОХОДНОЙ РЕЖИМ: Любое физическое переключение тумблера инвертирует статус реле
 void handlePhysicalInputs() {
   uint8_t raw = readByteInputs();
   for (int i = 1; i <= 8; i++) {
-    bool isPressed = !((raw & (1 << (7 - (i - 1)))) != 0);
+    bool isClosed = !((raw & (1 << (7 - (i - 1)))) != 0);
     uint8_t bit = (1 << (i - 1));
-    bool wasPressed = (lastInputStates & bit) != 0;
+    bool wasClosed = (lastInputStates & bit) != 0;
     
-    if (isPressed != wasPressed) {
-      if (isPressed) lastInputStates |= bit; else lastInputStates &= ~bit;
-      setRelayChannel(i, isPressed);
+    if (isClosed != wasClosed) {
+      if (isClosed) lastInputStates |= bit; 
+      else lastInputStates &= ~bit;
+      
+      bool currentRelayState = getRelayChannel(i);
+      setRelayChannel(i, !currentRelayState);
     }
   }
 }
@@ -500,15 +507,11 @@ void applyDamperDAC(float percent) {
   currentDamperPercent = percent;
 
   uint8_t dacValue = 0;
-  if (percent <= 0.05f) {
-    dacValue = (currentProfile == PROFILE_VALVE_4_20MA) ? 51 : 0;
+  if (currentProfile == PROFILE_VALVE_4_20MA) {
+    float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
+    dacValue = (uint8_t)round((currentmA / 20.0f) * 255.0f);
   } else {
-    if (currentProfile == PROFILE_VALVE_4_20MA) {
-      float currentmA = 4.0f + ((percent / 100.0f) * 16.0f);
-      dacValue = (uint8_t)round((currentmA / 20.0f) * 255.0f);
-    } else {
-      dacValue = (uint8_t)round((percent / 100.0f) * 255.0f);
-    }
+    dacValue = (uint8_t)round((percent / 100.0f) * 255.0f);
   }
 
   dacWrite(DAMPER_OUTPUT_PIN, dacValue);
@@ -620,6 +623,7 @@ void processTemperaturesAsync() {
   }
 }
 
+// ================= ЛОГИКА ПИД ИЗ V3.8.2 =================
 void processPID() {
   unsigned long now = millis();
 
@@ -640,16 +644,20 @@ void processPID() {
 
   if (!isPidEnabled || isAntiStuckActive) return;
   
-  if (!tempOutOnline || filteredTempOut <= -50.0f) { 
-    setDamperPercent(100.0, false); 
-    return; 
-  }
-  
-  pidInput = filteredTempOut;
-  
-  if (hydroPID.Compute()) {
-    if (abs(pidOutput - targetDamperPercent) >= PID_DEADBAND_PCT) {
-      setDamperPercent(pidOutput, false);
+  if (now - lastPidCompute >= PID_COMPUTE_INTERVAL) { 
+    lastPidCompute = now;
+    
+    if (!tempOutOnline || filteredTempOut <= -50.0f) { 
+      setDamperPercent(100.0, false); 
+      return; 
+    }
+    
+    pidInput = filteredTempOut;
+    
+    if (hydroPID.Compute()) {
+      if (abs(pidOutput - targetDamperPercent) >= PID_DEADBAND_PCT) {
+        setDamperPercent(pidOutput, false);
+      }
     }
   }
 }
@@ -667,7 +675,7 @@ void publishPidStatus() {
 
 // ================= HA DISCOVERY =================
 void sendHADiscovery() {
-  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_board"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v4.0.5(FreeRTOS)"},"availability":[{"topic":"asic/status"}])raw";
+  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_board"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v4.1.3(FreeRTOS)"},"availability":[{"topic":"asic/status"}])raw";
   #define PUB_DISC(comp, id, ...) snprintf(discPayloadBuf, sizeof(discPayloadBuf), "{%s,%s}", dev_av, (__VA_ARGS__)); mqttPublish("homeassistant/" comp "/asic_hydro/" id "/config", discPayloadBuf, true); delay(20);
 
   PUB_DISC("switch", "master", R"raw("name":"Master Switch","unique_id":"eh_master","state_topic":"asic/master/state","command_topic":"asic/master/set","icon":"mdi:power")raw");
@@ -676,7 +684,7 @@ void sendHADiscovery() {
   PUB_DISC("switch", "force_manual", R"raw("name":"Force Manual Mode (Hold PID)","unique_id":"eh_force_man","state_topic":"asic/pid/force_manual/state","command_topic":"asic/pid/force_manual/set","icon":"mdi:hand-back-right","entity_category":"config")raw");
   PUB_DISC("switch", "pid_inv", R"raw("name":"PID Invert Direction","unique_id":"eh_pid_inv","state_topic":"asic/pid/invert/state","command_topic":"asic/pid/invert/set","icon":"mdi:swap-horizontal","entity_category":"config")raw");
 
-  PUB_DISC("number", "pid_sp", R"raw("name":"Target Temperature Tout","unique_id":"eh_pid_sp","state_topic":"asic/pid/setpoint/state","command_topic":"asic/pid/setpoint/set","min":21,"max":85,"step":0.5,"unit_of_measurement":"°C","icon":"mdi:target-account")raw");
+  PUB_DISC("number", "pid_sp", R"raw("name":"Target Temperature Tout","unique_id":"eh_pid_sp","state_topic":"asic/pid/setpoint/state","command_topic":"asic/pid/setpoint/set","min":20,"max":85,"step":0.5,"unit_of_measurement":"°C","icon":"mdi:target-account")raw");
   PUB_DISC("number", "pid_kp", R"raw("name":"PID Kp","unique_id":"eh_pid_kp","state_topic":"asic/pid/kp/state","command_topic":"asic/pid/kp/set","min":0,"max":50,"step":0.1,"entity_category":"config")raw");
   PUB_DISC("number", "pid_ki", R"raw("name":"PID Ki","unique_id":"eh_pid_ki","state_topic":"asic/pid/ki/state","command_topic":"asic/pid/ki/set","min":0,"max":10,"step":0.01,"entity_category":"config")raw");
   PUB_DISC("number", "pid_kd", R"raw("name":"PID Kd","unique_id":"eh_pid_kd","state_topic":"asic/pid/kd/state","command_topic":"asic/pid/kd/set","min":0,"max":50,"step":0.1,"entity_category":"config")raw");
@@ -707,18 +715,122 @@ void sendHADiscovery() {
 void setupWebOTA() {
   server.on("/", HTTP_GET, [](){
     if (!server.authenticate(http_username, http_password)) return server.requestAuthentication();
-    const char html[] PROGMEM = R"rawliteral(<!DOCTYPE html><html><head><title>ASIC OTA</title><meta charset='utf-8'></head><body><h2>⚡ ASIC Hydro Controller (v4.0.5 FreeRTOS)</h2><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='firmware' accept='.bin' required><button type='submit'>Upload</button></form></body></html>)rawliteral";
-    server.send(200, "text/html", html);
+    
+    static const char html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASIC HYDRO // FIRMWARE OVERRIDE</title>
+    <style>
+        :root {
+            --bg: #080b10; --card: rgba(13,19,28,0.9); --primary: #00ff66;
+            --primary-glow: rgba(0,255,102,0.4); --accent: #00e5ff; --danger: #ff0055;
+            --font: 'Courier New', monospace;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: var(--bg); color: #c0f0d0; font-family: var(--font); display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .container { width: 100%; max-width: 500px; padding: 25px; background: var(--card); border: 1px solid var(--primary); box-shadow: 0 0 20px var(--primary-glow); border-radius: 8px; }
+        .header { text-align: center; margin-bottom: 20px; border-bottom: 1px dashed var(--primary); padding-bottom: 10px; }
+        .header h1 { color: var(--primary); font-size: 1.3rem; letter-spacing: 2px; }
+        .drop-zone { border: 2px dashed var(--accent); border-radius: 6px; padding: 25px 15px; text-align: center; cursor: pointer; background: rgba(0,229,255,0.02); }
+        .drop-zone:hover { border-color: var(--primary); background: rgba(0,255,102,0.05); }
+        .btn-browse { padding: 6px 12px; background: transparent; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font); cursor: pointer; margin-top: 8px; }
+        input[type="file"] { display: none; }
+        .file-info { margin-top: 15px; font-size: 0.85rem; color: var(--primary); display: none; }
+        .progress-wrapper { margin-top: 15px; display: none; }
+        .progress-bar-bg { width: 100%; height: 16px; background: #000; border: 1px solid var(--primary); border-radius: 3px; overflow: hidden; }
+        .progress-bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--primary)); }
+        .progress-text { display: flex; justify-content: space-between; font-size: 0.75rem; margin-top: 5px; color: var(--accent); }
+        .btn-upload { width: 100%; margin-top: 15px; padding: 10px; background: transparent; border: 1px solid var(--primary); color: var(--primary); font-family: var(--font); font-weight: bold; cursor: pointer; display: none; }
+        .btn-upload:hover { background: var(--primary); color: #000; }
+        .console-log { margin-top: 15px; background: #000; border: 1px solid rgba(0,255,102,0.3); padding: 8px; font-size: 0.75rem; height: 70px; overflow-y: auto; color: #70a080; }
+        .console-log .success { color: var(--primary); }
+        .console-log .error { color: var(--danger); }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>⚡ SYSTEM OVERRIDE</h1>
+        <div style="font-size: 0.75rem; color: var(--accent);">ASIC HYDRO CONTROLLER // OTA</div>
+    </div>
+    <form id="uploadForm">
+        <div class="drop-zone" id="dropZone">
+            <p>> DROP .BIN FILE HERE</p>
+            <button type="button" class="btn-browse" onclick="document.getElementById('fileInput').click()">[ SELECT FILE ]</button>
+            <input type="file" id="fileInput" name="firmware" accept=".bin">
+        </div>
+        <div class="file-info" id="fileInfo"></div>
+        <div class="progress-wrapper" id="progressWrapper">
+            <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressBar"></div></div>
+            <div class="progress-text"><span id="progressStatus">FLASHING...</span><span id="progressPercent">0%</span></div>
+        </div>
+        <button type="button" class="btn-upload" id="uploadBtn" onclick="uploadFirmware()">[ EXECUTE FLASH ]</button>
+    </form>
+    <div class="console-log" id="consoleLog"><p>> OTA PIPELINE READY...</p></div>
+</div>
+<script>
+    const dropZone = document.getElementById('dropZone'), fileInput = document.getElementById('fileInput');
+    const fileInfo = document.getElementById('fileInfo'), uploadBtn = document.getElementById('uploadBtn');
+    const progressWrapper = document.getElementById('progressWrapper'), progressBar = document.getElementById('progressBar');
+    const progressPercent = document.getElementById('progressPercent'), progressStatus = document.getElementById('progressStatus');
+    const consoleLog = document.getElementById('consoleLog');
+
+    function log(msg, cls='') {
+        const p = document.createElement('p'); p.textContent = '> ' + msg; if(cls) p.className = cls;
+        consoleLog.appendChild(p); consoleLog.scrollTop = consoleLog.scrollHeight;
+    }
+    ['dragenter','dragover','dragleave','drop'].forEach(e => dropZone.addEventListener(e, ev => { ev.preventDefault(); ev.stopPropagation(); }));
+    dropZone.addEventListener('drop', e => { if(e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]); });
+    fileInput.addEventListener('change', () => { if(fileInput.files.length) handleFile(fileInput.files[0]); });
+
+    function handleFile(file) {
+        if(!file.name.endsWith('.bin')) { log('ERROR: .BIN REQUIRED!', 'error'); return; }
+        fileInfo.style.display = 'block'; fileInfo.textContent = `TARGET: ${file.name} (${(file.size/1024).toFixed(1)} KB)`;
+        uploadBtn.style.display = 'block'; log(`LOADED: ${file.name}`);
+    }
+
+    function uploadFirmware() {
+        const file = fileInput.files[0]; if(!file) return;
+        const formData = new FormData(); formData.append("firmware", file);
+        uploadBtn.style.display = 'none'; dropZone.style.display = 'none'; progressWrapper.style.display = 'block';
+        log('FLASHING STARTED...', 'success');
+        const xhr = new XMLHttpRequest(); xhr.open("POST", "/update", true);
+        xhr.upload.onprogress = e => {
+            if(e.lengthComputable) {
+                const p = Math.round((e.loaded/e.total)*100);
+                progressBar.style.width = p + '%'; progressPercent.textContent = p + '%';
+            }
+        };
+        xhr.onload = () => {
+            if(xhr.status === 200) {
+                progressBar.style.width = '100%'; progressPercent.textContent = '100%';
+                progressStatus.textContent = 'COMPLETE!'; log('SUCCESS! REBOOTING IN 10s...', 'success');
+                setTimeout(() => window.location.reload(), 10000);
+            } else { progressStatus.textContent = 'FAILED!'; log('ERROR: ' + xhr.responseText, 'error'); }
+        };
+        xhr.onerror = () => log('CONNECTION ERROR!', 'error');
+        xhr.send(formData);
+    }
+</script>
+</body>
+</html>
+    )rawliteral";
+
+    server.send_P(200, "text/html", html);
   });
   
   server.on("/update", HTTP_POST, [](){
     if (!server.authenticate(http_username, http_password)) return server.requestAuthentication();
-    if (!Update.hasError() && Update.size() > 0) {
-      server.send(200, "text/plain", "Update finished. Restarting...");
+    
+    if (!Update.hasError()) {
+      server.send(200, "text/plain", "SUCCESS");
       delay(1000);
       ESP.restart();
     } else {
-      server.send(400, "text/plain", "Update Failed!");
+      server.send(400, "text/plain", "FLASH_ERROR");
     }
   }, [](){
     HTTPUpload& upload = server.upload();
@@ -726,10 +838,17 @@ void setupWebOTA() {
       ota_active = true;
       relayStateMask = 0x00; 
       sendByteRelay();
+      
       if (mqtt_client) esp_mqtt_client_stop(mqtt_client);
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Serial);
+
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+        Update.printError(Serial);
+        ota_active = false;
+      }
     } else if (upload.status == UPLOAD_FILE_WRITE) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) Update.printError(Serial);
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
     } else if (upload.status == UPLOAD_FILE_END) {
       if (!Update.end(true)) {
         Update.printError(Serial);
@@ -746,37 +865,27 @@ void TaskControl(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = pdMS_TO_TICKS(100);
 
-  unsigned long lastPidTick = 0;
   unsigned long lastPressureTick = 0;
 
   for (;;) {
-    // 1. Вычитка команд ЦАП
     DamperCommand cmd;
     if (xQueueReceive(damperCmdQueue, &cmd, 0) == pdTRUE) {
       setDamperPercent(cmd.percent, cmd.isManual);
     }
 
-    // 2. Входы и рампа ЦАП
     handlePhysicalInputs();
     processDamperRamp();
-
-    // 3. Асинхронный OneWire
     processTemperaturesAsync();
-
+    
     unsigned long now = millis();
 
-    // 4. Modbus RTU (давление)
     if (now - lastPressureTick >= 2000) {
       readAndPublishPressure();
       lastPressureTick = now;
     }
 
-    // 5. ПИД
-    if (now - lastPidTick >= PID_COMPUTE_INTERVAL) {
-      processAntiStuck();
-      processPID();
-      lastPidTick = now;
-    }
+    processAntiStuck();
+    processPID();
 
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
@@ -795,28 +904,33 @@ void setup() {
 
   damperCmdQueue = xQueueCreate(10, sizeof(DamperCommand));
 
-  // Чтение настроек NVS
+  // СЧИТЫВАНИЕ НАСТРОЕК ИЗ NVS
   preferences.begin("asic_storage", true);
   relayStateMask = preferences.getUChar("relays", 0x00);
   isForceManual = preferences.getBool("pid_force_man", false);
   isPidEnabled = isForceManual ? false : preferences.getBool("pid_enable", false);
   pidSetpoint = preferences.getFloat("pid_setpoint", 42.0f);
+  isPidInverted = preferences.getBool("pid_inv", true);
   currentProfile = (OutputProfile)preferences.getUChar("out_profile", (uint8_t)PROFILE_VALVE_4_20MA);
   preferences.end();
 
-  // Безопасный 0%
+  // БЕЗОПАСНЫЙ СТАРТ
   targetDamperPercent = 0.0f;
-  currentDamperPercent = -1.0f;
+  currentDamperPercent = 0.0f;
   applyDamperDAC(0.0f);
 
   hydroPID.SetOutputLimits(0, 100);
   hydroPID.SetSampleTimeUs(PID_COMPUTE_INTERVAL * 1000);
   hydroPID.SetTunings(pidKp, pidKi, pidKd);
+  hydroPID.SetControllerDirection(isPidInverted ? QuickPID::Action::reverse : QuickPID::Action::direct);
   hydroPID.SetMode(isPidEnabled ? QuickPID::Control::automatic : QuickPID::Control::manual);
 
   sendByteRelay(); 
   digitalWrite(PIN_OE_74HC595, LOW);
   
+  // ФИКСАЦИЯ НАЧАЛЬНОГО ПОЛОЖЕНИЯ ТУМБЛЕРОВ
+  lastInputStates = readByteInputs();
+
   sensorsIn.begin(); 
   sensorsOut.begin();
   sensorsIn.setWaitForConversion(false);
@@ -842,11 +956,10 @@ void setup() {
   
   startupComplete = true;
 
-  // Создаем ТОЛЬКО задачу контроля на Ядре 1. Задача Сети будет работать в loop() на Ядре 0!
   xTaskCreatePinnedToCore(TaskControl, "TaskControl", 8192, NULL, 5, NULL, 1);
 }
 
-// ================= MAIN LOOP (TASK NETWORK НА CORE 0) =================
+// ================= MAIN LOOP (CORE 0) =================
 void loop() {
   server.handleClient();
 
@@ -864,7 +977,7 @@ void loop() {
       publishPidStatus();
       publishProfileStatus();
       publishRevertTimer();
-      publishActuatorMetrics(targetDamperPercent);
+      setDamperPercent(targetDamperPercent, false);
       needPublishAllStates = false;
     }
 
@@ -879,10 +992,9 @@ void loop() {
       publishAllRelayStates();
       publishPidStatus();
       publishProfileStatus();
-      publishActuatorMetrics(targetDamperPercent);
       lastRelayPublish = now;
     }
   }
 
-  delay(10); // Позволяет встроенному WDT ядра 0 корректно отдыхать
+  delay(10);
 }
