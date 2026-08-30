@@ -173,75 +173,75 @@ build_flags =
 
 #### 📥 Управление (Subscribed):
 
--   `asic/master/set` --- Мастер-выключатель всей системы (`ON` / `OFF`).
+-   **`asic/master/set`** --- Мастер-выключатель всей системы (**`ON`** / **`OFF`**).
 
--   `asic/profile/set` --- Выбор режима управления ЦАП (`VALVE_4_20MA` / `DRY_COOLER_0_10V`).
+-   **`asic/profile/set`** --- Выбор режима управления ЦАП (**`VALVE_4_20MA`** / **`DRY_COOLER_0_10V`**).
 
--   `asic/mode/set` --- Выбор режима работы системы (`AUTO` / `MANUAL`).
+-   **`asic/mode/set`** --- Выбор режима работы системы (**`AUTO`** / **`MANUAL`**).
 
--   `asic/pid/enable/set` --- Включение/выключение авто-ПИД (`ON` / `OFF`).
+-   **`asic/pid/enable/set`** --- Включение/выключение авто-ПИД (**`ON`** / **`OFF`**).
 
--   `asic/pid/force_manual/set` --- Принудительное удержание ручного режима (`ON` / `OFF`).
+-   **`asic/pid/force_manual/set`** --- Принудительное удержание ручного режима (**`ON`** / **`OFF`**).
 
--   `asic/pid/invert/set` --- Инверсия направления ПИД (`ON` --- Reverse/Охлаждение, `OFF` --- Direct).
+-   **`asic/pid/invert/set`** --- Инверсия направления ПИД (**`ON`** --- Reverse/Охлаждение, **`OFF`** --- Direct).
 
--   `asic/pid/setpoint/set` --- Уставка целевой температурыToutTout​(число `20.0`--`85.0`).
+-   **`asic/pid/setpoint/set`** --- Уставка целевой температурыToutTout​(число **`20.0`**--**`85.0`**).
 
--   `asic/pid/kp/set`, `ki/set`, `kd/set` --- Настройка коэффициентов ПИД.
+-   **`asic/pid/kp/set`**, **`ki/set`**, **`kd/set`** --- Настройка коэффициентов ПИД.
 
--   `asic/damper/set` --- Ручная установка заслонки (`0`--`100`). *При ручном вводе ПИД временно отключается.*
+-   **`asic/damper/set`** --- Ручная установка заслонки (**`0`**--**`100`**). *При ручном вводе ПИД временно отключается.*
 
--   `asic/relay1/set` .. `asic/relay4/set` --- Управление майнерами (`ON` / `OFF`).
+-   **`asic/relay1/set`** .. **`asic/relay4/set`** --- Управление майнерами (**`ON`** / **`OFF`**).
 
--   `asic/pump/set` --- Управление насосом (`ON` / `OFF`).
+-   **`asic/pump/set`** --- Управление насосом (**`ON`** / **`OFF`**).
 
--   `asic/valve/set` --- Управление клапаном (`ON` / `OFF`).
+-   **`asic/valve/set`** --- Управление клапаном (**`ON`** / **`OFF`**).
 
--   `asic/relay7/set`, `asic/relay8/set` --- Дополнительные реле Aux 7, Aux 8 (`ON` / `OFF`).
+-   **`asic/relay7/set`**, **`asic/relay8/set`** --- Дополнительные реле Aux 7, Aux 8 (**`ON`** / **`OFF`**).
 
--   `asic/reset_nvs` --- Очистка флеш-памяти и сброс настроек к заводским (`RESET`).
+-   **`asic/reset_nvs`** --- Очистка флеш-памяти и сброс настроек к заводским (**`RESET`**).
 
 #### 📤 Метрики и состояния (Published):
 
--   `asic/status` --- Статус контроллера (`online` / `offline`).
+-   **`asic/status`** --- Статус контроллера (**`online`** / **`offline`**).
 
--   `asic/state` --- Текущее состояние конечного автомата (`BOOT`, `SELF_TEST`, `SAFE_STANDBY`, `RUNNING_AUTO`, `MANUAL`, `FAULT_FAILSAFE`, `EMERGENCY_SHUTDOWN`).
+-   **`asic/state`** --- Текущее состояние конечного автомата (**`BOOT`**, **`SELF_TEST`**, **`SAFE_STANDBY`**, **`RUNNING_AUTO`**, **`MANUAL`**, **`FAULT_FAILSAFE`**, **`EMERGENCY_SHUTDOWN`**).
 
--   `asic/fault` --- Код ошибки (`NONE`, `TEMP_OUT_LOST`, `TEMP_IN_LOST`, `PRESSURE_TIMEOUT`, `PRESSURE_OUT_OF_BOUNDS`, `AIR_IN_SYSTEM`).
+-   **`asic/fault`** --- Код ошибки (**`NONE`**, **`TEMP_OUT_LOST`**, **`TEMP_IN_LOST`**, **`PRESSURE_TIMEOUT`**, **`PRESSURE_OUT_OF_BOUNDS`**, **`AIR_IN_SYSTEM`**).
 
--   `asic/profile/state` --- Активный профиль оборудования (`VALVE_4_20MA` или `DRY_COOLER_0_10V`).
+-   **`asic/profile/state`** --- Активный профиль оборудования (**`VALVE_4_20MA`** или **`DRY_COOLER_0_10V`**).
 
--   `asic/mode/state` --- Текущий режим работы (`AUTO` / `MANUAL`).
+-   **`asic/mode/state`** --- Текущий режим работы (**`AUTO`** / **`MANUAL`**).
 
--   `asic/sensor/temp_in/state` --- Температура на входе (°C).
+-   **`asic/sensor/temp_in/state`** --- Температура на входе (°C).
 
--   `asic/sensor/temp_out/state` --- Температура на выходе (°C).
+-   **`asic/sensor/temp_out/state`** --- Температура на выходе (°C).
 
--   `asic/sensor/pressure/state` --- Давление в контуре (Bar).
+-   **`asic/sensor/pressure/state`** --- Давление в контуре (Bar).
 
--   `asic/sensor/air/state` --- Детекция воздуха (`ON` / `OFF`).
+-   **`asic/sensor/air/state`** --- Детекция воздуха (**`ON`** / **`OFF`**).
 
--   `asic/actuator/current_ma/state` --- Фактический ток при профиле `VALVE_4_20MA` (4.00--20.00 мА).
+-   **`asic/actuator/current_ma/state`** --- Фактический ток при профиле **`VALVE_4_20MA`** (4.00--20.00 мА).
 
--   `asic/actuator/voltage_v/state` --- Фактическое напряжение при профиле `DRY_COOLER_0_10V` (0.00--10.00 В).
+-   **`asic/actuator/voltage_v/state`** --- Фактическое напряжение при профиле **`DRY_COOLER_0_10V`** (0.00--10.00 В).
 
--   `asic/damper/state` --- Текущее положение заслонки (0--100%).
+-   **`asic/damper/state`** --- Текущее положение заслонки (0--100%).
 
--   `asic/pid/enable/state` --- Статус ПИД (`ON` / `OFF`).
+-   **`asic/pid/enable/state`** --- Статус ПИД (**`ON`** / **`OFF`**).
 
--   `asic/pid/force_manual/state` --- Статус принудительного ручного режима (`ON` / `OFF`).
+-   **`asic/pid/force_manual/state`** --- Статус принудительного ручного режима (**`ON`** / **`OFF`**).
 
--   `asic/pid/invert/state` --- Статус инверсии (`ON` / `OFF`).
+-   **`asic/pid/invert/state`** --- Статус инверсии (**`ON`** / **`OFF`**).
 
--   `asic/pid/setpoint/state` --- Уставка температуры (°C).
+-   **`asic/pid/setpoint/state`** --- Уставка температуры (°C).
 
--   `asic/pid/kp/state`, `ki/state`, `kd/state` --- Коэффициенты ПИД.
+-   **`asic/pid/kp/state`**, **`ki/state`**, **`kd/state`** --- Коэффициенты ПИД.
 
--   `asic/pid/revert_timer/state` --- Обратный отсчёт до автовозврата в ПИД-режим.
+-   **`asic/pid/revert_timer/state`** --- Обратный отсчёт до автовозврата в ПИД-режим.
 
--   `asic/master/state` --- Состояние Master Switch (`ON` / `OFF`).
+-   **`asic/master/state`** --- Состояние Master Switch (**`ON`** / **`OFF`**).
 
--   `asic/relay1/state` .. `asic/relay8/state` --- Состояние каждого реле.
+-   **`asic/relay1/state`** .. **`asic/relay8/state`** --- Состояние каждого реле.
 
 📜 Лицензия
 -----------
