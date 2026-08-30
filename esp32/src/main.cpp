@@ -1,15 +1,17 @@
 /*
  * ========================================================================================
- * ⚡ ESP32 ASIC HYDRO CONTROLLER – FREERTOS STABLE (v4.1.3 Toggle Switch Edition)
+ * ⚡ ESP32 ASIC HYDRO CONTROLLER – FREERTOS STABLE (v4.3.2 Production Safe Edition)
  * ========================================================================================
  * Плата: Eletechsup ES32D26 (ESP32-DevKitC 38-PIN)
  * 
- * Особенности v4.1.3:
- *  - ТУМБЛЕРЫ С ФИКСАЦИЕЙ (Проходной режим): Любое переключение тумблера инвертирует
- *    состояние канала, синхронизируя работу с веб-интерфейсом и MQTT.
- *  - СТАРТОВАЯ ИНИЦИАЛИЗАЦИЯ: Начальное положение тумблеров фиксируется при загрузке.
- *  - БЕЗУСЛОВНОЕ ВЫКЛЮЧЕНИЕ: Аварийное отключение реле доступно всегда.
- *  - ПОЛНАЯ СТАБИЛЬНОСТЬ: Классический ПИД v3.8.2 + FreeRTOS Dual Core + Web OTA.
+ * Особенности v4.3.2:
+ *  - АППАРАТНЫЙ МЬЮТЕКС: Защита сдвигового регистра 74HC595 от гонки потоков (relayMutex).
+ *  - ЗАЩИТА NVS (Wear-Leveling): Отложенное сохранение статусов реле (debounce 2 сек).
+ *  - АВТО-РЕЖИМ (Auto Safe Boot): При старте асики принудительно OFF. После 5 сек 
+ *    Self-Test при отсутствии аварий асики восстанавливаются из памяти.
+ *  - РУЧНОЙ РЕЖИМ (Manual Mode): Мгновенное восстановление, отключение всех защит FSM.
+ *  - ИЗОЛЯЦИЯ MODBUS: TaskModbus (Core 0, 2000 мс) + TaskControl (Core 1, 100 мс).
+ *  - ДЕТЕКЦИЯ ВОЗДУХА: Буфер 10 точек + пауза 5 сек после пуска насоса + атомарный доступ.
  * ========================================================================================
  */
 
@@ -28,6 +30,33 @@
 #include "mqtt_client.h"
 
 #include "config.h"
+
+// ================= МАСКИ КАНАЛОВ РЕЛЕ =================
+constexpr uint8_t ASIC_MASK = 0xF0; // Каналы 1..4 (Биты 7..4: ASIC 1..4)
+constexpr uint8_t AUX_MASK  = 0x0F; // Каналы 5..8 (Биты 3..0: Pump, Valve, Relay 7, Relay 8)
+
+// ================= СОСТОЯНИЯ СИСТЕМЫ И АВАРИИ =================
+enum class SystemState : uint8_t {
+  BOOT = 0,
+  SELF_TEST,
+  SAFE_STANDBY,
+  RUNNING_AUTO,
+  MANUAL,
+  FAULT_FAILSAFE,
+  EMERGENCY_SHUTDOWN
+};
+
+enum class FaultCode : uint8_t {
+  NONE = 0,
+  TEMP_OUT_LOST,
+  TEMP_IN_LOST,
+  PRESSURE_TIMEOUT,
+  PRESSURE_OUT_OF_BOUNDS,
+  AIR_IN_SYSTEM
+};
+
+SystemState currentSystemState = SystemState::BOOT;
+FaultCode currentFault = FaultCode::NONE;
 
 // ================= ПРОФИЛИ ВЫХОДА =================
 enum OutputProfile {
@@ -49,6 +78,9 @@ constexpr uint8_t PIN_CLK_74HC165 = 2;
 constexpr uint8_t PIN_SH_74HC165  = 0;
 
 uint8_t lastInputStates = 0x00;
+uint8_t debouncedInputStates = 0x00;
+unsigned long lastDebounceTime[8] = {0};
+constexpr unsigned long DEBOUNCE_DELAY_MS = 50;
 
 // ================= ПИНЫ DS18B20 =================
 constexpr uint8_t TEMP_IN_PIN  = 19;
@@ -110,11 +142,25 @@ AntiStuckState antiStuckStep = ANTI_STUCK_IDLE;
 unsigned long antiStuckStepTimer = 0;
 constexpr unsigned long ANTI_STUCK_MOVE_TIME = 15000UL;
 
-// ================= MODBUS =================
+// ================= MODBUS И ДЕТЕКЦИЯ ВОЗДУХА =================
 constexpr uint8_t RS485_DIR_PIN = 21;
 constexpr uint8_t PRESSURE_SENSOR_ADDR = 1;
 ModbusMaster node;
+portMUX_TYPE pressureMux = portMUX_INITIALIZER_UNLOCKED;
+
 float currentPressureBar = 0.0f;
+bool isPressureOnline = false;
+unsigned long lastPressureSuccessTime = 0;
+constexpr unsigned long PRESSURE_TIMEOUT_MS = 5000;
+
+constexpr int PRESSURE_SAMPLES = 10;
+float pressureHistory[PRESSURE_SAMPLES] = {0};
+int pressureSampleIndex = 0;
+int pressureSampleCount = 0;
+bool isAirDetected = false;
+bool lastPumpState = false;
+unsigned long pumpStartTime = 0;
+constexpr unsigned long PUMP_STABILIZATION_MS = 5000;
 
 void preTransmission() { digitalWrite(RS485_DIR_PIN, HIGH); delayMicroseconds(100); }
 void postTransmission() { delayMicroseconds(100); digitalWrite(RS485_DIR_PIN, LOW); delayMicroseconds(100); }
@@ -123,9 +169,14 @@ void postTransmission() { delayMicroseconds(100); digitalWrite(RS485_DIR_PIN, LO
 constexpr unsigned long TIMER_PUBLISH_INTERVAL = 10000;
 constexpr unsigned long RELAY_STATUS_INTERVAL = 60000;
 
-// ================= СИСТЕМНЫЕ ФЛАГИ =================
+// ================= СИСТЕМНЫЕ ФЛАГИ И МЬЮТЕКСЫ =================
 bool isAutoMode = true;
 uint8_t relayStateMask = 0x00;
+uint8_t savedRelaysMask = 0x00;       
+bool selfTestComplete = false;        
+unsigned long selfTestStartTime = 0;
+constexpr unsigned long SELF_TEST_DURATION = 5000; 
+
 bool ota_active = false;
 bool startupComplete = false;
 
@@ -133,8 +184,13 @@ volatile bool isMqttConnected = false;
 volatile bool needSendDiscovery = false;
 volatile bool needPublishAllStates = false;
 
+// Отложенное сохранение NVS (защита от износа)
+bool needSaveRelays = false;
+unsigned long lastRelayChangeTime = 0;
+
 // FREERTOS ОБЪЕКТЫ
 QueueHandle_t damperCmdQueue = NULL;
+SemaphoreHandle_t relayMutex = NULL; // Мьютекс для шины 74HC595
 
 // СЕТЕВЫЕ ОБЪЕКТЫ
 esp_mqtt_client_handle_t mqtt_client = NULL;
@@ -153,6 +209,7 @@ void publishMasterState();
 void publishAllRelayStates();
 void publishSystemMode();
 void publishPidStatus();
+void publishSafetyStatus();
 void setDamperPercent(float percent, bool isManual = false);
 void applyDamperDAC(float percent);
 void sendHADiscovery();
@@ -160,7 +217,9 @@ void publishRevertTimer();
 void publishActuatorMetrics(float percent);
 void publishProfileStatus();
 void processAntiStuck();
+void evaluateSafety();
 void saveRelaysToNVS();
+void saveSystemModeToNVS();
 uint8_t readByteInputs();
 bool isMasterOn() { return (relayStateMask != 0x00); }
 
@@ -181,10 +240,50 @@ void mqttSubscribe(const char* topic) {
 void saveRelaysToNVS() {
   preferences.begin("asic_storage", false);
   preferences.putUChar("relays", relayStateMask);
+  savedRelaysMask = relayStateMask;
+  preferences.end();
+}
+
+void saveSystemModeToNVS() {
+  preferences.begin("asic_storage", false);
+  preferences.putBool("auto_mode", isAutoMode);
   preferences.end();
 }
 
 // ================= ПУБЛИКАЦИЯ СТАТУСА И МЕТРИК =================
+void publishSafetyStatus() {
+  if (!isMqttConnected) return;
+
+  const char* stateStr = "UNKNOWN";
+  switch (currentSystemState) {
+    case SystemState::BOOT:               stateStr = "BOOT"; break;
+    case SystemState::SELF_TEST:          stateStr = "SELF_TEST"; break;
+    case SystemState::SAFE_STANDBY:       stateStr = "SAFE_STANDBY"; break;
+    case SystemState::RUNNING_AUTO:       stateStr = "RUNNING_AUTO"; break;
+    case SystemState::MANUAL:             stateStr = "MANUAL"; break;
+    case SystemState::FAULT_FAILSAFE:     stateStr = "FAULT_FAILSAFE"; break;
+    case SystemState::EMERGENCY_SHUTDOWN: stateStr = "EMERGENCY_SHUTDOWN"; break;
+  }
+  mqttPublish("asic/state", stateStr, true);
+
+  const char* faultStr = "NONE";
+  switch (currentFault) {
+    case FaultCode::NONE:                   faultStr = "NONE"; break;
+    case FaultCode::TEMP_OUT_LOST:          faultStr = "TEMP_OUT_LOST"; break;
+    case FaultCode::TEMP_IN_LOST:           faultStr = "TEMP_IN_LOST"; break;
+    case FaultCode::PRESSURE_TIMEOUT:       faultStr = "PRESSURE_TIMEOUT"; break;
+    case FaultCode::PRESSURE_OUT_OF_BOUNDS: faultStr = "PRESSURE_OUT_OF_BOUNDS"; break;
+    case FaultCode::AIR_IN_SYSTEM:          faultStr = "AIR_IN_SYSTEM"; break;
+  }
+  mqttPublish("asic/fault", faultStr, true);
+
+  bool airState;
+  portENTER_CRITICAL(&pressureMux);
+  airState = isAirDetected;
+  portEXIT_CRITICAL(&pressureMux);
+  mqttPublish("asic/sensor/air/state", airState ? "ON" : "OFF", true);
+}
+
 void publishProfileStatus() {
   if (!isMqttConnected) return;
   const char* profStr = (currentProfile == PROFILE_VALVE_4_20MA) ? "VALVE_4_20MA" : "DRY_COOLER_0_10V";
@@ -348,23 +447,42 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         }
       }
       else if (strcmp(topic, "asic/pid/kp/set") == 0) {
-        pidKp = atof(message); hydroPID.SetTunings(pidKp, pidKi, pidKd); publishPidStatus();
+        pidKp = atof(message);
+        hydroPID.SetTunings(pidKp, pidKi, pidKd);
+        preferences.begin("asic_storage", false);
+        preferences.putFloat("pid_kp", pidKp);
+        preferences.end();
+        publishPidStatus();
       }
       else if (strcmp(topic, "asic/pid/ki/set") == 0) {
-        pidKi = atof(message); hydroPID.SetTunings(pidKp, pidKi, pidKd); publishPidStatus();
+        pidKi = atof(message);
+        hydroPID.SetTunings(pidKp, pidKi, pidKd);
+        preferences.begin("asic_storage", false);
+        preferences.putFloat("pid_ki", pidKi);
+        preferences.end();
+        publishPidStatus();
       }
       else if (strcmp(topic, "asic/pid/kd/set") == 0) {
-        pidKd = atof(message); hydroPID.SetTunings(pidKp, pidKi, pidKd); publishPidStatus();
+        pidKd = atof(message);
+        hydroPID.SetTunings(pidKp, pidKi, pidKd);
+        preferences.begin("asic_storage", false);
+        preferences.putFloat("pid_kd", pidKd);
+        preferences.end();
+        publishPidStatus();
       }
       else if (strcmp(topic, "asic/master/set") == 0) {
         if (!startupComplete) break;
         relayStateMask = isOn ? 0xFF : 0x00;
         sendByteRelay(); 
-        saveRelaysToNVS();
+        
+        needSaveRelays = true;
+        lastRelayChangeTime = millis();
         publishAllRelayStates();
       }
       else if (strcmp(topic, "asic/mode/set") == 0) {
-        isAutoMode = (strcmp(message, "AUTO") == 0); publishSystemMode();
+        isAutoMode = (strcmp(message, "AUTO") == 0);
+        saveSystemModeToNVS();
+        publishSystemMode();
       }
       else if (strcmp(topic, "asic/relay1/set") == 0) setRelayChannel(1, isOn);
       else if (strcmp(topic, "asic/relay2/set") == 0) setRelayChannel(2, isOn);
@@ -412,12 +530,17 @@ void initNativeMqtt() {
 
 // ================= ЖЕЛЕЗО И РЕЛЕ =================
 void sendByteRelay() {
-  digitalWrite(PIN_RCLK_74HC595, LOW);
-  for (int i = 0; i < 8; ++i) {
-    digitalWrite(PIN_SER_74HC595, (relayStateMask & (1 << i)) ? HIGH : LOW);
-    digitalWrite(PIN_SRCLK_74HC595, LOW); delayMicroseconds(1); digitalWrite(PIN_SRCLK_74HC595, HIGH);
+  if (relayMutex != NULL) {
+    if (xSemaphoreTake(relayMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      digitalWrite(PIN_RCLK_74HC595, LOW);
+      for (int i = 0; i < 8; ++i) {
+        digitalWrite(PIN_SER_74HC595, (relayStateMask & (1 << i)) ? HIGH : LOW);
+        digitalWrite(PIN_SRCLK_74HC595, LOW); delayMicroseconds(1); digitalWrite(PIN_SRCLK_74HC595, HIGH);
+      }
+      digitalWrite(PIN_RCLK_74HC595, HIGH);
+      xSemaphoreGive(relayMutex);
+    }
   }
-  digitalWrite(PIN_RCLK_74HC595, HIGH);
 }
 
 bool getRelayChannel(uint8_t channel) { return (relayStateMask & (1 << (8 - channel))) != 0; }
@@ -429,7 +552,11 @@ void setRelayChannel(uint8_t channel, bool state) {
   
   if (state) relayStateMask |= bit; else relayStateMask &= ~bit;
   sendByteRelay(); 
-  saveRelaysToNVS();
+  
+  // Отложенное сохранение (защита NVS)
+  needSaveRelays = true;
+  lastRelayChangeTime = millis();
+  
   publishRelayState(channel); 
   publishMasterState();
 }
@@ -449,7 +576,7 @@ void publishMasterState() { mqttPublish("asic/master/state", isMasterOn() ? "ON"
 void publishSystemMode() { mqttPublish("asic/mode/state", isAutoMode ? "AUTO" : "MANUAL", true); }
 void publishAllRelayStates() { for (int i = 1; i <= 8; i++) publishRelayState(i); publishMasterState(); }
 
-// ================= ФИЗИЧЕСКИЕ ТУМБЛЕРЫ (IN1..IN8) =================
+// ================= ФИЗИЧЕСКИЕ ТУМБЛЕРЫ (IN1..IN8) С ДЕБАУНСОМ =================
 uint8_t readByteInputs() {
   uint8_t input_byte = 0x00;
   digitalWrite(PIN_SH_74HC165, LOW); delayMicroseconds(1); digitalWrite(PIN_SH_74HC165, HIGH); delayMicroseconds(1);
@@ -460,20 +587,29 @@ uint8_t readByteInputs() {
   return input_byte;
 }
 
-// ПРОХОДНОЙ РЕЖИМ: Любое физическое переключение тумблера инвертирует статус реле
 void handlePhysicalInputs() {
   uint8_t raw = readByteInputs();
+  unsigned long now = millis();
+
   for (int i = 1; i <= 8; i++) {
-    bool isClosed = !((raw & (1 << (7 - (i - 1)))) != 0);
+    bool rawReading = !((raw & (1 << (7 - (i - 1)))) != 0);
     uint8_t bit = (1 << (i - 1));
-    bool wasClosed = (lastInputStates & bit) != 0;
-    
-    if (isClosed != wasClosed) {
-      if (isClosed) lastInputStates |= bit; 
-      else lastInputStates &= ~bit;
-      
-      bool currentRelayState = getRelayChannel(i);
-      setRelayChannel(i, !currentRelayState);
+    bool lastReading = (lastInputStates & bit) != 0;
+
+    if (rawReading != lastReading) {
+      lastDebounceTime[i - 1] = now;
+      if (rawReading) lastInputStates |= bit; else lastInputStates &= ~bit;
+    }
+
+    if ((now - lastDebounceTime[i - 1]) > DEBOUNCE_DELAY_MS) {
+      bool debouncedState = (debouncedInputStates & bit) != 0;
+      if (rawReading != debouncedState) {
+        if (rawReading) debouncedInputStates |= bit; else debouncedInputStates &= ~bit;
+        
+        // Инвертируем текущее состояние реле (Toggle)
+        bool currentRelayState = getRelayChannel(i);
+        setRelayChannel(i, !currentRelayState);
+      }
     }
   }
 }
@@ -528,7 +664,8 @@ void processDamperRamp() {
 void processAntiStuck() {
   unsigned long now = millis();
 
-  if (!isAntiStuckActive && isAutoMode && isPidEnabled) {
+  // Антизалипание работает только в автоматическом режиме регулирования
+  if (!isAntiStuckActive && isAutoMode && isPidEnabled && currentSystemState == SystemState::RUNNING_AUTO) {
     if (now - lastAntiStuckRun >= ANTI_STUCK_INTERVAL) {
       lastAntiStuckRun = now;
       isAntiStuckActive = true;
@@ -573,12 +710,102 @@ void processAntiStuck() {
   }
 }
 
-void readAndPublishPressure() {
-  if (node.readHoldingRegisters(0x0004, 1) == node.ku8MBSuccess) {
-    float kpa = (int16_t)node.getResponseBuffer(0) / 10.0f;
-    currentPressureBar = kpa / 100.0f;
-    char strBuf[16]; snprintf(strBuf, sizeof(strBuf), "%.2f", currentPressureBar);
-    mqttPublish("asic/sensor/pressure/state", strBuf, true);
+// ================= ДЕТЕКЦИЯ ВОЗДУХА =================
+void resetAirDetectionBuffer() {
+  pressureSampleIndex = 0;
+  pressureSampleCount = 0;
+  
+  portENTER_CRITICAL(&pressureMux);
+  isAirDetected = false;
+  portEXIT_CRITICAL(&pressureMux);
+  
+  for (int i = 0; i < PRESSURE_SAMPLES; i++) {
+    pressureHistory[i] = 0.0f;
+  }
+}
+
+void checkAirInSystem(float newPressure) {
+  bool currentPumpState = getRelayChannel(5);
+
+  if (currentPumpState != lastPumpState) {
+    lastPumpState = currentPumpState;
+    resetAirDetectionBuffer();
+    if (currentPumpState) {
+      pumpStartTime = millis();
+    }
+  }
+
+  if (!currentPumpState) {
+    portENTER_CRITICAL(&pressureMux);
+    isAirDetected = false;
+    portEXIT_CRITICAL(&pressureMux);
+    return;
+  }
+
+  if (millis() - pumpStartTime < PUMP_STABILIZATION_MS) {
+    return;
+  }
+
+  pressureHistory[pressureSampleIndex] = newPressure;
+  pressureSampleIndex = (pressureSampleIndex + 1) % PRESSURE_SAMPLES;
+  
+  if (pressureSampleCount < PRESSURE_SAMPLES) {
+    pressureSampleCount++;
+    return;
+  }
+
+  float sum = 0;
+  for (int i = 0; i < PRESSURE_SAMPLES; i++) {
+    sum += pressureHistory[i];
+  }
+  float mean = sum / (float)PRESSURE_SAMPLES;
+
+  float variance = 0;
+  for (int i = 0; i < PRESSURE_SAMPLES; i++) {
+    variance += pow(pressureHistory[i] - mean, 2);
+  }
+  float stdDev = sqrt(variance / (float)PRESSURE_SAMPLES);
+
+  bool detected = (stdDev > 0.08f);
+  
+  portENTER_CRITICAL(&pressureMux);
+  isAirDetected = detected;
+  portEXIT_CRITICAL(&pressureMux);
+}
+
+// ================= FREERTOS TASK 2: MODBUS ISOLATED (CORE 0) =================
+void TaskModbus(void *pvParameters) {
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  const TickType_t xFrequency = pdMS_TO_TICKS(2000); // Опрос раз в 2 секунды
+
+  for (;;) {
+    if (!ota_active) {
+      if (node.readHoldingRegisters(0x0004, 1) == node.ku8MBSuccess) {
+        float kpa = (int16_t)node.getResponseBuffer(0) / 10.0f;
+        float localPressure = kpa / 100.0f;
+        
+        checkAirInSystem(localPressure);
+
+        portENTER_CRITICAL(&pressureMux);
+        currentPressureBar = localPressure;
+        lastPressureSuccessTime = millis();
+        isPressureOnline = true;
+        bool localAirState = isAirDetected;
+        portEXIT_CRITICAL(&pressureMux);
+
+        char strBuf[16]; 
+        snprintf(strBuf, sizeof(strBuf), "%.2f", localPressure);
+        mqttPublish("asic/sensor/pressure/state", strBuf, true);
+        mqttPublish("asic/sensor/air/state", localAirState ? "ON" : "OFF", true);
+      } else {
+        portENTER_CRITICAL(&pressureMux);
+        if (millis() - lastPressureSuccessTime > PRESSURE_TIMEOUT_MS) {
+          isPressureOnline = false;
+        }
+        portEXIT_CRITICAL(&pressureMux);
+      }
+    }
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
 }
 
@@ -600,8 +827,11 @@ void processTemperaturesAsync() {
       char strBuf[16];
       if (tempIn > -55.0f && tempIn < 125.0f) {
         lastTempIn = tempIn;
+        tempInOnline = true;
         snprintf(strBuf, sizeof(strBuf), "%.1f", tempIn);
         mqttPublish("asic/sensor/temp_in/state", strBuf, true);
+      } else {
+        tempInOnline = false;
       }
 
       if (tempOut > -55.0f && tempOut < 125.0f) {
@@ -623,7 +853,88 @@ void processTemperaturesAsync() {
   }
 }
 
-// ================= ЛОГИКА ПИД ИЗ V3.8.2 =================
+// ================= SAFETY MANAGER & POLICY ENGINE =================
+void evaluateSafety() {
+  if (!startupComplete) return;
+
+  // 1. РУЧНОЙ РЕЖИМ (Полное отключение проверок и невмешательство Safety Manager)
+  if (!isAutoMode) {
+    currentSystemState = SystemState::MANUAL;
+    currentFault = FaultCode::NONE;
+    return;
+  }
+
+  // 2. АВТО-РЕЖИМ: Фаза Self-Test при старте
+  if (!selfTestComplete) {
+    currentSystemState = SystemState::SELF_TEST;
+    if (millis() - selfTestStartTime < SELF_TEST_DURATION) {
+      return; // Ждем 5 сек самодиагностики
+    }
+
+    // Проверяем статус датчиков
+    bool pressOk;
+    portENTER_CRITICAL(&pressureMux);
+    pressOk = isPressureOnline;
+    portEXIT_CRITICAL(&pressureMux);
+
+    if (tempOutOnline && filteredTempOut > -50.0f && filteredTempOut <= 115.0f && pressOk) {
+      selfTestComplete = true;
+      // Восстанавливаем сохраненное состояние всех реле (включая асики 1..4)
+      relayStateMask = savedRelaysMask;
+      sendByteRelay();
+      publishAllRelayStates();
+    } else {
+      // Ошибка датчиков при старте: асики остаются OFF, заслонка 100%
+      currentSystemState = SystemState::FAULT_FAILSAFE;
+      currentFault = (!tempOutOnline) ? FaultCode::TEMP_OUT_LOST : FaultCode::PRESSURE_TIMEOUT;
+      setDamperPercent(100.0f, false);
+      return;
+    }
+  }
+
+  // 3. АВТО-РЕЖИМ: Мониторинг в реальном времени
+  bool localPressOnline;
+  bool localAirDetected;
+  portENTER_CRITICAL(&pressureMux);
+  localPressOnline = isPressureOnline;
+  localAirDetected = isAirDetected;
+  portEXIT_CRITICAL(&pressureMux);
+
+  if (!tempOutOnline || filteredTempOut <= -50.0f || filteredTempOut > 115.0f) {
+    currentSystemState = SystemState::FAULT_FAILSAFE;
+    currentFault = FaultCode::TEMP_OUT_LOST;
+    setDamperPercent(100.0f, false);
+    return;
+  }
+
+  if (!localPressOnline) {
+    currentSystemState = SystemState::FAULT_FAILSAFE;
+    currentFault = FaultCode::PRESSURE_TIMEOUT;
+    setDamperPercent(100.0f, false);
+    return;
+  }
+
+  if (localAirDetected) {
+    currentFault = FaultCode::AIR_IN_SYSTEM;
+  } else if (currentFault == FaultCode::AIR_IN_SYSTEM) {
+    currentFault = FaultCode::NONE;
+  }
+
+  // Штатный сброс критических аварий
+  if (currentFault == FaultCode::TEMP_OUT_LOST || currentFault == FaultCode::PRESSURE_TIMEOUT) {
+    currentFault = FaultCode::NONE;
+  }
+
+  if (isForceManual) {
+    currentSystemState = SystemState::MANUAL;
+  } else if (isPidEnabled) {
+    currentSystemState = SystemState::RUNNING_AUTO;
+  } else {
+    currentSystemState = SystemState::SAFE_STANDBY;
+  }
+}
+
+// ================= ЛОГИКА ПИД =================
 void processPID() {
   unsigned long now = millis();
 
@@ -643,15 +954,10 @@ void processPID() {
   }
 
   if (!isPidEnabled || isAntiStuckActive) return;
+  if (isAutoMode && currentSystemState != SystemState::RUNNING_AUTO) return;
   
   if (now - lastPidCompute >= PID_COMPUTE_INTERVAL) { 
     lastPidCompute = now;
-    
-    if (!tempOutOnline || filteredTempOut <= -50.0f) { 
-      setDamperPercent(100.0, false); 
-      return; 
-    }
-    
     pidInput = filteredTempOut;
     
     if (hydroPID.Compute()) {
@@ -675,15 +981,25 @@ void publishPidStatus() {
 
 // ================= HA DISCOVERY =================
 void sendHADiscovery() {
-  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_board"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v4.1.3(FreeRTOS)"},"availability":[{"topic":"asic/status"}])raw";
+  const char* dev_av = R"raw("device":{"identifiers":["esp32_asic_hydro_board"],"name":"ASIC Hydro Controller","manufacturer":"Eletechsup","model":"ES32D26","sw_version":"v4.3.2(FreeRTOS)"},"availability":[{"topic":"asic/status"}])raw";
   #define PUB_DISC(comp, id, ...) snprintf(discPayloadBuf, sizeof(discPayloadBuf), "{%s,%s}", dev_av, (__VA_ARGS__)); mqttPublish("homeassistant/" comp "/asic_hydro/" id "/config", discPayloadBuf, true); delay(20);
 
+  // 1. Системные FSM сенсоры
+  PUB_DISC("sensor", "sys_state", R"raw("name":"System State","unique_id":"eh_state","state_topic":"asic/state","icon":"mdi:state-machine")raw");
+  PUB_DISC("sensor", "sys_fault", R"raw("name":"Fault Code","unique_id":"eh_fault","state_topic":"asic/fault","icon":"mdi:alert-circle")raw");
+
+  // 2. Детекция завоздушивания (Binary Sensor)
+  PUB_DISC("binary_sensor", "air_detected", R"raw("name":"Air In Loop Detected","unique_id":"eh_air_det","state_topic":"asic/sensor/air/state","payload_on":"ON","payload_off":"OFF","device_class":"problem","icon":"mdi:air-filter")raw");
+
+  // 3. Управление питанием и режимами
   PUB_DISC("switch", "master", R"raw("name":"Master Switch","unique_id":"eh_master","state_topic":"asic/master/state","command_topic":"asic/master/set","icon":"mdi:power")raw");
   PUB_DISC("select", "cooling_profile", R"raw("name":"Cooling Equipment Type","unique_id":"eh_profile","state_topic":"asic/profile/state","command_topic":"asic/profile/set","options":["VALVE_4_20MA","DRY_COOLER_0_10V"],"icon":"mdi:fan-auto","entity_category":"config")raw");
+  PUB_DISC("select", "sys_mode", R"raw("name":"System Operation Mode","unique_id":"eh_mode","state_topic":"asic/mode/state","command_topic":"asic/mode/set","options":["AUTO","MANUAL"],"icon":"mdi:cog-sync")raw");
   PUB_DISC("switch", "pid_en", R"raw("name":"PID Auto-Control","unique_id":"eh_pid_en","state_topic":"asic/pid/enable/state","command_topic":"asic/pid/enable/set","icon":"mdi:thermostat-auto")raw");
   PUB_DISC("switch", "force_manual", R"raw("name":"Force Manual Mode (Hold PID)","unique_id":"eh_force_man","state_topic":"asic/pid/force_manual/state","command_topic":"asic/pid/force_manual/set","icon":"mdi:hand-back-right","entity_category":"config")raw");
   PUB_DISC("switch", "pid_inv", R"raw("name":"PID Invert Direction","unique_id":"eh_pid_inv","state_topic":"asic/pid/invert/state","command_topic":"asic/pid/invert/set","icon":"mdi:swap-horizontal","entity_category":"config")raw");
 
+  // 4. Параметры ПИД
   PUB_DISC("number", "pid_sp", R"raw("name":"Target Temperature Tout","unique_id":"eh_pid_sp","state_topic":"asic/pid/setpoint/state","command_topic":"asic/pid/setpoint/set","min":20,"max":85,"step":0.5,"unit_of_measurement":"°C","icon":"mdi:target-account")raw");
   PUB_DISC("number", "pid_kp", R"raw("name":"PID Kp","unique_id":"eh_pid_kp","state_topic":"asic/pid/kp/state","command_topic":"asic/pid/kp/set","min":0,"max":50,"step":0.1,"entity_category":"config")raw");
   PUB_DISC("number", "pid_ki", R"raw("name":"PID Ki","unique_id":"eh_pid_ki","state_topic":"asic/pid/ki/state","command_topic":"asic/pid/ki/set","min":0,"max":10,"step":0.01,"entity_category":"config")raw");
@@ -691,6 +1007,7 @@ void sendHADiscovery() {
 
   PUB_DISC("sensor", "pid_timer", R"raw("name":"PID Auto-Revert Countdown","unique_id":"eh_pid_timer","state_topic":"asic/pid/revert_timer/state","icon":"mdi:timer-sand")raw");
 
+  // 5. Силовые реле
   PUB_DISC("switch", "asic_1", R"raw("name":"ASIC 1","unique_id":"eh_r1","state_topic":"asic/relay1/state","command_topic":"asic/relay1/set","icon":"mdi:server")raw");
   PUB_DISC("switch", "asic_2", R"raw("name":"ASIC 2","unique_id":"eh_r2","state_topic":"asic/relay2/state","command_topic":"asic/relay2/set","icon":"mdi:server")raw");
   PUB_DISC("switch", "asic_3", R"raw("name":"ASIC 3","unique_id":"eh_r3","state_topic":"asic/relay3/state","command_topic":"asic/relay3/set","icon":"mdi:server")raw");
@@ -698,10 +1015,11 @@ void sendHADiscovery() {
   PUB_DISC("switch", "pump", R"raw("name":"Coolant Pump","unique_id":"eh_pump","state_topic":"asic/pump/state","command_topic":"asic/pump/set","icon":"mdi:pump")raw");
   PUB_DISC("switch", "valve", R"raw("name":"Heat Valve","unique_id":"eh_valve","state_topic":"asic/valve/state","command_topic":"asic/valve/set","icon":"mdi:pipe-valve")raw");
   PUB_DISC("switch", "relay_7", R"raw("name":"Aux Relay 7","unique_id":"eh_r7","state_topic":"asic/relay7/state","command_topic":"asic/relay7/set","icon":"mdi:toggle-switch")raw");
-  PUB_DISC("switch", "relay_8", R"raw("name":"Aux Relay 8","unique_id":"eh_r8","state_topic":"asic/relay8/state","command_topic":"asic/relay8/set","icon":"mdi:toggle-switch")raw");
+  PUB_DISC("switch", "relay_8", R"raw("name":"Aux Relay 8","unique_id":"eh_relay8","state_topic":"asic/relay8/state","command_topic":"asic/relay8/set","icon":"mdi:toggle-switch")raw");
 
   PUB_DISC("button", "reset_nvs", R"raw("name":"Reset Memory (NVS)","unique_id":"eh_reset_nvs","command_topic":"asic/reset_nvs","payload_press":"RESET","icon":"mdi:restore","entity_category":"config")raw");
 
+  // 6. Датчики и метрики
   PUB_DISC("number", "damper", R"raw("name":"Actuator Target Open","unique_id":"eh_damper","state_topic":"asic/damper/state","command_topic":"asic/damper/set","min":0,"max":100,"unit_of_measurement":"%","icon":"mdi:fan")raw");
   PUB_DISC("sensor", "actuator_ma", R"raw("name":"Valve Current Output (Io2)","unique_id":"eh_actuator_ma","state_topic":"asic/actuator/current_ma/state","unit_of_measurement":"mA","icon":"mdi:current-ac")raw");
   PUB_DISC("sensor", "actuator_v", R"raw("name":"Dry Cooler Voltage Output (Vo2)","unique_id":"eh_actuator_v","state_topic":"asic/actuator/voltage_v/state","unit_of_measurement":"V","icon":"mdi:sine-wave")raw");
@@ -865,8 +1183,6 @@ void TaskControl(void *pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = pdMS_TO_TICKS(100);
 
-  unsigned long lastPressureTick = 0;
-
   for (;;) {
     DamperCommand cmd;
     if (xQueueReceive(damperCmdQueue, &cmd, 0) == pdTRUE) {
@@ -877,13 +1193,7 @@ void TaskControl(void *pvParameters) {
     processDamperRamp();
     processTemperaturesAsync();
     
-    unsigned long now = millis();
-
-    if (now - lastPressureTick >= 2000) {
-      readAndPublishPressure();
-      lastPressureTick = now;
-    }
-
+    evaluateSafety();
     processAntiStuck();
     processPID();
 
@@ -897,6 +1207,8 @@ void setup() {
   pinMode(PIN_SER_74HC595, OUTPUT); pinMode(PIN_RCLK_74HC595, OUTPUT); pinMode(PIN_SRCLK_74HC595, OUTPUT);
   pinMode(PIN_QH_74HC165, INPUT); pinMode(PIN_CLK_74HC165, OUTPUT); pinMode(PIN_SH_74HC165, OUTPUT);
 
+  relayMutex = xSemaphoreCreateMutex();
+
   relayStateMask = 0x00; 
   sendByteRelay();
 
@@ -906,15 +1218,34 @@ void setup() {
 
   // СЧИТЫВАНИЕ НАСТРОЕК ИЗ NVS
   preferences.begin("asic_storage", true);
-  relayStateMask = preferences.getUChar("relays", 0x00);
+  savedRelaysMask = preferences.getUChar("relays", 0x00);
+  isAutoMode = preferences.getBool("auto_mode", true);
   isForceManual = preferences.getBool("pid_force_man", false);
   isPidEnabled = isForceManual ? false : preferences.getBool("pid_enable", false);
   pidSetpoint = preferences.getFloat("pid_setpoint", 42.0f);
+  pidKp = preferences.getFloat("pid_kp", 3.5f);
+  pidKi = preferences.getFloat("pid_ki", 0.05f);
+  pidKd = preferences.getFloat("pid_kd", 0.8f);
   isPidInverted = preferences.getBool("pid_inv", true);
   currentProfile = (OutputProfile)preferences.getUChar("out_profile", (uint8_t)PROFILE_VALVE_4_20MA);
   preferences.end();
 
-  // БЕЗОПАСНЫЙ СТАРТ
+  // ПОЛИТИКА ЗАГРУЗКИ РЕЛЕ ПРИ СТАРТЕ
+  if (isAutoMode) {
+    // В АВТО-РЕЖИМЕ: Включаем ТОЛЬКО гидравлику (AUX_MASK 0x0F: насос, клапаны).
+    // Каналы 1..4 (ASIC_MASK 0xF0) принудительно OFF. NVS НЕ перезаписываем!
+    relayStateMask = (savedRelaysMask & AUX_MASK);
+    selfTestComplete = false;
+    selfTestStartTime = millis();
+    currentSystemState = SystemState::SELF_TEST;
+  } else {
+    // В РУЧНОМ РЕЖИМЕ: Мгновенно восстанавливаем все реле из NVS без задержек и проверок
+    relayStateMask = savedRelaysMask;
+    selfTestComplete = true;
+    currentSystemState = SystemState::MANUAL;
+  }
+
+  // БЕЗОПАСНЫЙ СТАРТ ЦАП
   targetDamperPercent = 0.0f;
   currentDamperPercent = 0.0f;
   applyDamperDAC(0.0f);
@@ -930,6 +1261,7 @@ void setup() {
   
   // ФИКСАЦИЯ НАЧАЛЬНОГО ПОЛОЖЕНИЯ ТУМБЛЕРОВ
   lastInputStates = readByteInputs();
+  debouncedInputStates = lastInputStates;
 
   sensorsIn.begin(); 
   sensorsOut.begin();
@@ -956,7 +1288,11 @@ void setup() {
   
   startupComplete = true;
 
+  // ЯДРО 1: ЖЕСТКИЙ РЕАЛ-ТАЙМ КОНТУР УПРАВЛЕНИЯ (100 мс)
   xTaskCreatePinnedToCore(TaskControl, "TaskControl", 8192, NULL, 5, NULL, 1);
+
+  // ЯДРО 0: ИЗОЛИРОВАННЫЙ ОПРОС MODBUS RS485 (2000 мс)
+  xTaskCreatePinnedToCore(TaskModbus, "TaskModbus", 4096, NULL, 2, NULL, 0);
 }
 
 // ================= MAIN LOOP (CORE 0) =================
@@ -965,6 +1301,12 @@ void loop() {
 
   if (!ota_active) {
     unsigned long now = millis();
+
+    // Защита от износа NVS: отложенное сохранение состояний реле
+    if (needSaveRelays && (now - lastRelayChangeTime >= 2000)) {
+      saveRelaysToNVS();
+      needSaveRelays = false;
+    }
 
     if (needSendDiscovery) {
       sendHADiscovery();
@@ -977,6 +1319,7 @@ void loop() {
       publishPidStatus();
       publishProfileStatus();
       publishRevertTimer();
+      publishSafetyStatus();
       setDamperPercent(targetDamperPercent, false);
       needPublishAllStates = false;
     }
@@ -984,6 +1327,7 @@ void loop() {
     static unsigned long lastTimerPub = 0;
     if (now - lastTimerPub >= TIMER_PUBLISH_INTERVAL) {
       publishRevertTimer();
+      publishSafetyStatus();
       lastTimerPub = now;
     }
 
@@ -992,6 +1336,7 @@ void loop() {
       publishAllRelayStates();
       publishPidStatus();
       publishProfileStatus();
+      publishSafetyStatus();
       lastRelayPublish = now;
     }
   }
